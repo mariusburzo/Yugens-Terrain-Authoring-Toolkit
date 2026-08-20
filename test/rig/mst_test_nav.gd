@@ -15,9 +15,19 @@ class_name MSTTestNav
 const REGION_NAME : String = "ChunkNav"
 const WELD_PRECISION : float = 100.0
 ## Cells of clearance carved back from walls, so agents do not hug the rock.
-## Never applied to the chunk's border ring: both sides of a seam must agree on
-## which border cells are walkable or the regions stop connecting.
+## Applied uniformly, including across chunk seams: the erosion pass reads
+## neighbouring chunks' height data, so both sides of a seam reach the same
+## verdict about a shared border cell and the regions still connect.
 const AGENT_RADIUS_CELLS : int = 1
+## Largest rectangle the merger will grow, in cells per side.
+##
+## Uncapped greedy merging produces long thin strips. Path corridors are chosen by
+## an A* over the polygon graph whose costs run between polygon entry points, so
+## elongated polygons distort those costs and the corridor picked is often not the
+## direct one, which shows up as a path running the length of a strip and then
+## turning sharply in open space. Squarer polygons cost more of them, but far
+## fewer than one per triangle.
+const MERGE_MAX_CELLS : int = 4
 
 
 ## Face extraction reads cell_geometry, which is empty on chunks hydrated from a
@@ -238,7 +248,12 @@ static func chunk_centre(terrain: MarchingSquaresTerrain, coords: Vector2i) -> V
 ## rectangles over runs of them. Cells that straddle a height change are dropped,
 ## which trims one cell of walkable surface along every wall — close to the agent
 ## radius erosion a Recast bake would have applied anyway.
-static func build_merged_navmesh(chunk: MarchingSquaresTerrainChunk, agent_radius_cells: int = AGENT_RADIUS_CELLS) -> Dictionary:
+static func build_merged_navmesh(
+		chunk: MarchingSquaresTerrainChunk,
+		terrain: MarchingSquaresTerrain = null,
+		agent_radius_cells: int = AGENT_RADIUS_CELLS,
+		max_cells: int = MERGE_MAX_CELLS
+) -> Dictionary:
 	var dims : Vector3i = chunk.dimensions
 	var cell_size : Vector2 = chunk.cell_size
 	var cells_x := dims.x - 1
@@ -256,7 +271,7 @@ static func build_merged_navmesh(chunk: MarchingSquaresTerrainChunk, agent_radiu
 		flat.append(row)
 
 	if agent_radius_cells > 0:
-		flat = _erode_for_agent(flat, cells_x, cells_z, agent_radius_cells)
+		flat = _erode_for_agent(flat, cells_x, cells_z, agent_radius_cells, terrain, chunk.chunk_coords)
 
 	var used : Array = []
 	for z in range(cells_z):
@@ -276,12 +291,17 @@ static func build_merged_navmesh(chunk: MarchingSquaresTerrainChunk, agent_radiu
 			if is_nan(height):
 				continue
 
-			# Grow east while the height matches, then south while the whole run matches.
+			# Grow east while the height matches, then south while the whole run
+			# matches, capped so the result stays roughly square.
 			var x_end := x
-			while x_end + 1 < cells_x and used[z][x_end + 1] == 0 and _same_height(flat[z][x_end + 1], height):
+			while x_end + 1 < cells_x:
+				if x_end - x + 1 >= max_cells:
+					break
+				if used[z][x_end + 1] == 1 or not _same_height(flat[z][x_end + 1], height):
+					break
 				x_end += 1
 			var z_end := z
-			while z_end + 1 < cells_z:
+			while z_end + 1 < cells_z and (z_end - z + 1) < max_cells:
 				var row_matches := true
 				for scan_x in range(x, x_end + 1):
 					if used[z_end + 1][scan_x] == 1 or not _same_height(flat[z_end + 1][scan_x], height):
@@ -307,10 +327,18 @@ static func build_merged_navmesh(chunk: MarchingSquaresTerrainChunk, agent_radiu
 ## Drops walkable cells within `radius` of a wall or a height change, leaving a
 ## margin an agent can stand in without clipping the rock.
 ##
-## The chunk's outer ring is exempt. A chunk cannot see its neighbour's cells, so
-## eroding at the border would let the two sides disagree about which border
-## cells survive, and the seam would stop connecting.
-static func _erode_for_agent(flat: Array, cells_x: int, cells_z: int, radius: int) -> Array:
+## Cells near the chunk edge look their neighbours up through the terrain, so a
+## wall just over a seam erodes this chunk exactly as it erodes that one. Without
+## that, clearance vanished wherever a wall happened to sit near a chunk border,
+## which showed up as a pillar with a margin on three sides and none on the fourth.
+static func _erode_for_agent(
+		flat: Array,
+		cells_x: int,
+		cells_z: int,
+		radius: int,
+		terrain: MarchingSquaresTerrain,
+		chunk_coords: Vector2i
+) -> Array:
 	var result : Array = []
 	for z in range(cells_z):
 		result.append(PackedFloat32Array(flat[z]))
@@ -320,16 +348,24 @@ static func _erode_for_agent(flat: Array, cells_x: int, cells_z: int, radius: in
 			var height : float = flat[z][x]
 			if is_nan(height):
 				continue
-			if x < radius or z < radius or x >= cells_x - radius or z >= cells_z - radius:
-				continue
+			var near_edge := x < radius or z < radius or x >= cells_x - radius or z >= cells_z - radius
 			var blocked := false
 			for dz in range(-radius, radius + 1):
 				for dx in range(-radius, radius + 1):
 					var nx := x + dx
 					var nz := z + dz
-					if nx < 0 or nz < 0 or nx >= cells_x or nz >= cells_z:
+					var neighbour : float
+					if nx >= 0 and nz >= 0 and nx < cells_x and nz < cells_z:
+						neighbour = flat[nz][nx]
+					elif near_edge and terrain != null:
+						neighbour = _flat_cell_height_global(
+							terrain,
+							chunk_coords.x * cells_x + nx,
+							chunk_coords.y * cells_z + nz
+						)
+					else:
 						continue
-					if not _same_height(flat[nz][nx], height):
+					if not _same_height(neighbour, height):
 						blocked = true
 						break
 				if blocked:
@@ -337,6 +373,18 @@ static func _erode_for_agent(flat: Array, cells_x: int, cells_z: int, radius: in
 			if blocked:
 				result[z][x] = NAN
 	return result
+
+
+## Flat height of a cell addressed in whole-terrain cell coordinates, resolving
+## which chunk owns it. NAN if the cell is not flat or no chunk covers it.
+static func _flat_cell_height_global(terrain: MarchingSquaresTerrain, global_x: int, global_z: int) -> float:
+	var stride_x := terrain.dimensions.x - 1
+	var stride_z := terrain.dimensions.z - 1
+	var coords := Vector2i(floori(float(global_x) / float(stride_x)), floori(float(global_z) / float(stride_z)))
+	var chunk : MarchingSquaresTerrainChunk = terrain.chunks.get(coords)
+	if chunk == null:
+		return NAN
+	return _flat_cell_height(chunk, global_x - coords.x * stride_x, global_z - coords.y * stride_z)
 
 
 static func _flat_cell_height(chunk: MarchingSquaresTerrainChunk, x: int, z: int) -> float:
@@ -418,7 +466,7 @@ static func adjacent_pair_failures(terrain: MarchingSquaresTerrain, grid: int) -
 
 
 static func build_merged_region(terrain: MarchingSquaresTerrain, chunk: MarchingSquaresTerrainChunk, agent_radius_cells: int = AGENT_RADIUS_CELLS) -> int:
-	var result := build_merged_navmesh(chunk, agent_radius_cells)
+	var result := build_merged_navmesh(chunk, terrain, agent_radius_cells, MERGE_MAX_CELLS)
 	var region := chunk.get_node_or_null(REGION_NAME) as NavigationRegion3D
 	if region == null:
 		region = NavigationRegion3D.new()

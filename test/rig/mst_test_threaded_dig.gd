@@ -115,7 +115,7 @@ func _run_worker() -> void:
 # silently undo the merge for whichever chunk was just dug, and a cave with one
 # dense chunk in it stops pathing.
 func _build_navmesh(chunk: MarchingSquaresTerrainChunk) -> NavigationMesh:
-	return MSTTestNav.build_merged_navmesh(chunk)["navmesh"]
+	return MSTTestNav.build_merged_navmesh(chunk, _terrain)["navmesh"]
 
 
 ## Joins the worker and applies everything that has to touch the scene tree.
