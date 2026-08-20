@@ -22,6 +22,7 @@ const NAV_SCALE_GRID : int = 5
 ## Pan speed as a fraction of the orbit distance, so it scales with zoom.
 const CAMERA_PAN_SPEED : float = 0.9
 const CAMERA_PAN_BOOST : float = 3.0
+const AGENT_SPEED : float = 14.0
 
 @export var run_large_dimensions : bool = true
 @export var run_small_dimensions : bool = true
@@ -40,6 +41,8 @@ var _camera_pitch : float = -0.9
 var _camera_target : Vector3 = Vector3.ZERO
 var _camera_distance : float = 120.0
 var _dig_count : int = 0
+var _agent_body : Node3D
+var _agent : NavigationAgent3D
 
 
 func _ready() -> void:
@@ -647,10 +650,13 @@ func _setup_camera() -> void:
 	_camera.far = 4000.0
 	add_child(_camera)
 	_update_camera()
-	print("[rig] Interactive mode: right-drag orbit, wheel zoom, WASD pan, Q/E down/up, Shift to move faster, left-click to dig.")
+	_spawn_agent()
+	print("[rig] Interactive mode: right-drag orbit, wheel zoom, WASD pan, Q/E down/up, Shift faster.")
+	print("[rig] Left-click digs. Middle-click sends the red cube there.")
 
 
 func _process(delta: float) -> void:
+	_move_agent(delta)
 	if not is_instance_valid(_camera):
 		return
 
@@ -711,14 +717,22 @@ func _unhandled_input(event: InputEvent) -> void:
 			_update_camera()
 		elif event.button_index == MOUSE_BUTTON_LEFT:
 			_dig_at_screen_position(event.position)
+		elif event.button_index == MOUSE_BUTTON_MIDDLE:
+			var hit := _raycast_from_screen(event.position)
+			if not hit.is_empty():
+				_send_agent_to(hit["position"])
 
 
-func _dig_at_screen_position(screen_position: Vector2) -> void:
+func _raycast_from_screen(screen_position: Vector2) -> Dictionary:
 	var from := _camera.project_ray_origin(screen_position)
 	var to := from + _camera.project_ray_normal(screen_position) * 4000.0
 	var query := PhysicsRayQueryParameters3D.create(from, to)
 	query.collide_with_areas = false
-	var hit := get_world_3d().direct_space_state.intersect_ray(query)
+	return get_world_3d().direct_space_state.intersect_ray(query)
+
+
+func _dig_at_screen_position(screen_position: Vector2) -> void:
+	var hit := _raycast_from_screen(screen_position)
 	if hit.is_empty():
 		return
 
@@ -743,7 +757,7 @@ func _dig_at_screen_position(screen_position: Vector2) -> void:
 		var chunk : MarchingSquaresTerrainChunk = terrain.chunks.get(coords)
 		if chunk == null or chunk.get_node_or_null(MSTTestNav.REGION_NAME) == null:
 			continue
-		MSTTestNav.build_region(terrain, chunk)
+		MSTTestNav.build_merged_region(terrain, chunk)
 		nav_regions += 1
 	if nav_regions > 0:
 		nav_msec = (Time.get_ticks_usec() - nav_start) / 1000.0
@@ -753,6 +767,67 @@ func _dig_at_screen_position(screen_position: Vector2) -> void:
 	print("[rig] dig %d on %s at (%d, %d): %.2f ms total (mesh %.2f, collision %.2f, nav faces %.2f) across %d chunk(s); %d nav region(s) rebuilt in %.2f ms" % [
 		_dig_count, terrain.name, gx, gz, result["total_msec"], result["mesh_msec"], result["collision_msec"],
 		result["nav_msec"], result["chunks_affected"], nav_regions, nav_msec
+	])
+
+
+## A red cube driven by a NavigationAgent3D, so the merged navmesh can be seen
+## working rather than only reported on. Dropped onto the 25-chunk cave, which is
+## the terrain that keeps its regions.
+func _spawn_agent() -> void:
+	if not is_instance_valid(_live_nav_terrain):
+		return
+
+	_agent_body = Node3D.new()
+	_agent_body.name = "Walker"
+	add_child(_agent_body)
+	_agent_body.global_position = MSTTestNav.chunk_centre(_live_nav_terrain, Vector2i(0, 0)) + _live_nav_terrain.position
+
+	var box := BoxMesh.new()
+	box.size = Vector3(2.0, 2.0, 2.0)
+	var material := StandardMaterial3D.new()
+	material.albedo_color = Color(0.9, 0.15, 0.15)
+	material.emission_enabled = true
+	material.emission = Color(0.35, 0.0, 0.0)
+	var cube := MeshInstance3D.new()
+	cube.name = "Cube"
+	cube.mesh = box
+	cube.material_override = material
+	cube.position = Vector3(0.0, 1.0, 0.0)
+	_agent_body.add_child(cube)
+
+	_agent = NavigationAgent3D.new()
+	_agent.name = "Agent"
+	_agent.radius = 1.0
+	_agent.height = 2.0
+	_agent.path_desired_distance = 1.0
+	_agent.target_desired_distance = 1.5
+	_agent.avoidance_enabled = false
+	_agent.debug_enabled = true
+	_agent_body.add_child(_agent)
+
+
+func _move_agent(delta: float) -> void:
+	if not is_instance_valid(_agent) or not is_instance_valid(_agent_body):
+		return
+	if _agent.is_navigation_finished():
+		return
+	var next := _agent.get_next_path_position()
+	var step := next - _agent_body.global_position
+	if step.length() < 0.001:
+		return
+	_agent_body.global_position += step.normalized() * AGENT_SPEED * delta
+
+
+func _send_agent_to(target: Vector3) -> void:
+	if not is_instance_valid(_agent):
+		return
+	_agent.target_position = target
+	# The path is computed against the map, so read it back rather than trusting
+	# the click: an unreachable target still produces a partial path.
+	await get_tree().physics_frame
+	var path := _agent.get_current_navigation_path()
+	print("[rig] walker target %s: %d path point(s), %.1f m away" % [
+		str(target.round()), path.size(), _agent_body.global_position.distance_to(target)
 	])
 
 

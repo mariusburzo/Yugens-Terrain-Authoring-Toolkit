@@ -1,6 +1,6 @@
-[gd_scene load_steps=2 format=3]
+[gd_scene format=3 uid="uid://cg532be4nka12"]
 
-[ext_resource type="Script" path="res://test/rig/mst_test_rig.gd" id="1_rig"]
+[ext_resource type="Script" uid="uid://by5gkbyuplk3t" path="res://test/rig/mst_test_rig.gd" id="1_rig"]
 
-[node name="MSTTestRig" type="Node3D"]
+[node name="MSTTestRig" type="Node3D" unique_id=97729233]
 script = ExtResource("1_rig")

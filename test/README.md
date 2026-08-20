@@ -25,6 +25,8 @@ Afterwards the last assembled terrain stays in the scene:
 
 - right-drag to orbit, wheel to zoom, **WASD to pan** (Q/E for down/up, Shift to move faster)
 - **left-click to dig** — each dig prints its own timing breakdown
+- **middle-click to send the red cube there** — a `NavigationAgent3D` walking the
+  merged navmesh, so you can watch pathing react to a dig in real time
 
 Several terrains are spread around the origin, so pan to find them: the 3x3 live
 terrain at the origin, the 2-chunk nav terrain to the north, the threading terrain

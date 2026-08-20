@@ -111,26 +111,11 @@ func _run_worker() -> void:
 	worker_msec = (Time.get_ticks_usec() - start_usec) / 1000.0
 
 
+# Merged rectangles, not one polygon per triangle. A per-triangle rebuild would
+# silently undo the merge for whichever chunk was just dug, and a cave with one
+# dense chunk in it stops pathing.
 func _build_navmesh(chunk: MarchingSquaresTerrainChunk) -> NavigationMesh:
-	var permission : Variant = null
-	if _terrain.navmesh_painting_enabled:
-		permission = chunk.navmesh_permission
-	var faces := chunk.get_nav_walkable_faces_for_permission(_terrain.nav_max_slope, permission)
-	var nav_mesh := NavigationMesh.new()
-	if faces.is_empty():
-		return nav_mesh
-	var vertices := PackedVector3Array()
-	var lookup : Dictionary = {}
-	var polygons : Array[PackedInt32Array] = []
-	for index in range(0, faces.size(), 3):
-		var polygon := PackedInt32Array()
-		for offset in range(3):
-			polygon.append(MSTTestNav._weld(lookup, vertices, faces[index + offset]))
-		polygons.append(polygon)
-	nav_mesh.set_vertices(vertices)
-	for polygon in polygons:
-		nav_mesh.add_polygon(polygon)
-	return nav_mesh
+	return MSTTestNav.build_merged_navmesh(chunk)["navmesh"]
 
 
 ## Joins the worker and applies everything that has to touch the scene tree.
