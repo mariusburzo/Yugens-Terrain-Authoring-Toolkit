@@ -96,6 +96,32 @@ intended — 13106 triangles down to 4518, precisely 9/25 — but the scoped sou
 source**, at ~266 triangles each, because the parser tessellates their `CylinderShape3D` and
 `BoxShape3D` colliders. That is what per-chunk groups and projected obstructions attack.
 
+**A square kilometre works, but pathfinding does not reach across it.** 1024 chunks of
+32 m, 1024 regions, **105992 polygons**. A corner-to-corner query over 1403 m returns a
+partial path that stops ~340 m along, and walking outward one chunk at a time puts the
+practical reach at roughly **600 m**, about 19 chunks. This is the same wall the
+per-triangle navmesh hit at 25 chunks: Godot's A* over the polygon graph does not complete
+over that many polygons, and it degrades by returning a partial path rather than failing.
+Nothing about the geometry or the seams is wrong - `recast-seams` passes throughout.
+
+The answer is not a bake setting. It is to stop keeping the whole map's regions live:
+enable regions near the agent and disable the rest, or path hierarchically (chunk graph
+first, polygons within). Phase 10 now reports `path reach along one edge` so the ceiling is
+a measured number rather than a surprise.
+
+**Scale exposed four costs that were O(map) on paths that should be O(dig).** None of them
+showed at 25 chunks; at 1024 they turned a ~2 ms dig into ~13 ms:
+
+| | 25 chunks | 1024 chunks | fix |
+| --- | --- | --- | --- |
+| `prepare()` | 0.10 ms | 3.98 ms | `refresh_chunks(coords)` re-resolves only what was dug |
+| terrain publish | 0.83 ms | 5.91 ms | `rebuild_lod_proxies(terrain, coords)` skips the full `apply()` |
+| chop source build | 0.43 ms | 1.86 ms | obstructions bucketed by chunk instead of scanned |
+| nav publish | 0.09 ms | 0.65 ms | polygon totals kept per chunk, not recounted |
+
+The lesson generalises past this rig: anything that walks `terrain.chunks` or a global list
+belongs at load, not in the edit loop. Worth re-reading any per-dig code with that in mind.
+
 **Parsed geometry keeps its walk-under clearance; a carve would not.** With the deck 3.0 m up
 and `agent_height` at 2.0, the floor beneath each bridge stays walkable and horizontal
 clearance under a deck measures 0.00 m - the navmesh runs directly under it. The same bridge
@@ -287,8 +313,12 @@ needs. To iterate on navmesh work, leave `run_recast_nav` on and the rest off:
 | `run_threading` | 6 — warm-up, threaded dig, collision continuity | one 2x2 terrain |
 | `run_nav_scale` | 7–8 — the 25-chunk cave, per-triangle then merged | assembles and warms 25 chunks |
 | `run_recast_nav` | 9 — props and chunked Recast baking | assembles 25 chunks, bakes them three times |
+| `run_large_map` | 10 — a whole map at scale | off by default; `large_map_chunks` chunks assembled, decorated and baked in tiles |
 
-Turning off `run_large_dimensions` or `run_small_dimensions` halves whatever is left.
+`chunk_sizes` selects which chunk spans to run at — 16 m (9x9 vertices), 32 m (17x17) or
+64 m (33x33), any combination. Each selected size runs the whole suite again, so it is the
+biggest lever on runtime; it is also the biggest lever on per-dig cost, which is why more
+than one can be selected.
 
 The interactive camera frames whichever terrain survives — the Recast cave if phase 9 ran,
 otherwise the largest thing still in the scene — so a nav-only run still opens on the cave
@@ -359,6 +389,8 @@ near a chunk border there is the rig proving its point, not a defect.
 | `recast-sees-props` (obstruction mode) | Crates inside the climb band block too | holds |
 | `lod-survives-threaded-dig` | A threaded dig leaves every chunk a live LOD proxy | holds |
 | `recast-walk-under-bridge` | The floor under a bridge deck stays walkable | holds |
+| `large-map-queryable` | A 1024-chunk map answers a corner-to-corner query | **fails** - engine limit, see below |
+| `large-map-dig-loop` | One chunk re-bakes under 5 ms with 1024 regions live | failed at 6.93 ms; four O(map) costs fixed since |
 | `recast-seams` | Chunked Recast regions meet across every seam unaided | holds |
 | `recast-parallel` | The pool bake beats the same bakes done one at a time | holds |
 | `recast-dig-loop` | Re-baking one chunk leaves under 5 ms on the main thread | holds |

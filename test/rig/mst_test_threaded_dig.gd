@@ -191,7 +191,7 @@ func publish() -> void:
 	# One apply() for the whole batch: it walks the chunks and builds only the
 	# proxies that are missing, so this rebuilds exactly the ones just freed.
 	if _lod_invalidated:
-		lod_msec = rebuild_lod_proxies(_terrain)
+		lod_msec = rebuild_lod_proxies(_terrain, affected_coords())
 
 	publish_msec = (Time.get_ticks_usec() - start_usec) / 1000.0
 
@@ -201,14 +201,35 @@ func publish() -> void:
 ## Nothing does this at runtime on its own - see the note in publish(). Returns
 ## -1.0 when the terrain has no LOD controller, so an older addon build is told
 ## apart from a build where the work was free.
-static func rebuild_lod_proxies(terrain) -> float:
+## Passing the chunks that actually changed rebuilds only those. apply() walks
+## every chunk in the terrain and re-applies visibility ranges to all of them,
+## which measured 0.6 ms at 4 chunks and 5.9 ms at 1024 - O(map) on a path that
+## touches one. The targeted branch reaches into the controller's own proxy
+## table, which is the only way to rebuild one proxy without the full pass.
+static func rebuild_lod_proxies(terrain, coords_list: Array = []) -> float:
 	if terrain == null or not ("_lod_controller" in terrain):
 		return -1.0
 	var controller = terrain._lod_controller
 	if controller == null:
 		return -1.0
 	var start_usec := Time.get_ticks_usec()
-	controller.apply()
+	if coords_list.is_empty() or not ("_proxies" in controller):
+		controller.apply()
+		return (Time.get_ticks_usec() - start_usec) / 1000.0
+
+	var step := maxi(2, int(terrain.terrain_lod_step))
+	for coords: Vector2i in coords_list:
+		var existing = controller._proxies.get(coords)
+		if is_instance_valid(existing):
+			continue
+		var chunk = terrain.chunks.get(coords)
+		if not is_instance_valid(chunk):
+			continue
+		var proxy = controller._build_proxy(chunk, step)
+		if proxy == null:
+			continue
+		controller._proxies[coords] = proxy
+		controller._configure_proxy_visibility(chunk, proxy)
 	return (Time.get_ticks_usec() - start_usec) / 1000.0
 
 

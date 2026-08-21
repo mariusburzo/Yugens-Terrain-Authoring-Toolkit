@@ -162,7 +162,19 @@ var parse_root : Node3D
 ##
 ## Whatever is listed here must also be kept out of the parsed geometry, or it
 ## is represented twice. exclude_collision_mask is how.
-var obstructions : Array = []
+var obstructions : Array:
+	get:
+		return _obstructions
+	set(value):
+		_obstructions = value
+		# Bucketed by chunk on assignment. Scanning the whole list per bake is
+		# O(map): at 1024 chunks that is ~6000 entries tested to carve nine.
+		_obstruction_index.clear()
+		for entry: Dictionary in value:
+			var key : Vector2i = entry.get("coords", Vector2i.ZERO)
+			if not _obstruction_index.has(key):
+				_obstruction_index[key] = []
+			_obstruction_index[key].append(entry)
 ## Collision layers removed from geometry_collision_mask before any parse.
 ##
 ## Props sit on their own layer, so masking that layer out is what stops them
@@ -291,6 +303,12 @@ var _map_cell_size : float = 0.25
 var _map_cell_height : float = 0.25
 var _settings : NavigationMesh
 var _parsed_roots : Array = []
+var _obstructions : Array = []
+## coords -> Array of obstruction dictionaries standing over that chunk.
+var _obstruction_index : Dictionary = {}
+## coords -> polygon count of the region published for it, so totals do not need
+## a walk over every live region.
+var _region_polygons : Dictionary = {}
 
 
 ## Moves the navigation map onto this baker's cell size instead of the other way
@@ -436,6 +454,34 @@ func prepare(terrain: MarchingSquaresTerrain) -> int:
 	return _chunk_geometry.size()
 
 
+## Re-resolves just these chunks, instead of walking the whole terrain.
+##
+## prepare() is O(map) - 0.10 ms at 25 chunks, 3.98 ms at 1024 - which is the
+## wrong shape for a path that only ever touches a handful. rebuild_collision()
+## puts a new shape resource on a dug chunk, so its cached entry is the only one
+## that can be stale.
+func refresh_chunks(coords_list: Array) -> float:
+	var start_usec := Time.get_ticks_usec()
+	if _terrain != null:
+		var span_x := float(_terrain.dimensions.x - 1) * _terrain.cell_size.x
+		var span_z := float(_terrain.dimensions.z - 1) * _terrain.cell_size.y
+		for coords: Vector2i in coords_list:
+			var chunk = _terrain.chunks.get(coords)
+			if not is_instance_valid(chunk):
+				continue
+			var shape := find_collision_shape(chunk)
+			if shape == null:
+				continue
+			var origin : Vector3 = chunk.global_position
+			_chunk_geometry[coords] = {
+				"shape": shape,
+				"xform": chunk.global_transform,
+				"box": AABB(Vector3(origin.x, 0.0, origin.z), Vector3(span_x, 0.0, span_z)),
+			}
+	prepare_msec = (Time.get_ticks_usec() - start_usec) / 1000.0
+	return prepare_msec
+
+
 ## The chunk's collision proxy, which the addon builds as a single
 ## ConcavePolygonShape3D on a single hidden StaticBody3D.
 static func find_collision_shape(chunk: MarchingSquaresTerrainChunk) -> ConcavePolygonShape3D:
@@ -498,18 +544,15 @@ func build_source(coords_list: Array = []) -> NavigationMeshSourceGeometryData3D
 ## Scoped the same way the geometry is: an obstruction outside the bake box would
 ## be filtered out anyway, but carrying it costs a copy for nothing.
 func _add_obstructions(source: NavigationMeshSourceGeometryData3D, coords_list: Array) -> int:
-	if obstructions.is_empty():
+	if _obstructions.is_empty():
 		return 0
-	var wanted : Dictionary = {}
-	for coords: Vector2i in coords_list:
-		wanted[coords] = true
 	var added := 0
-	for obstruction: Dictionary in obstructions:
-		if not wanted.is_empty() and obstruction.has("coords") and not wanted.has(obstruction["coords"]):
-			continue
-		source.add_projected_obstruction(
-			obstruction["vertices"], obstruction["elevation"], obstruction["height"], true)
-		added += 1
+	var buckets : Array = coords_list if not coords_list.is_empty() else _obstruction_index.keys()
+	for coords: Vector2i in buckets:
+		for obstruction: Dictionary in _obstruction_index.get(coords, []):
+			source.add_projected_obstruction(
+				obstruction["vertices"], obstruction["elevation"], obstruction["height"], true)
+			added += 1
 	return added
 
 
@@ -796,19 +839,19 @@ func publish() -> void:
 			continue
 		_region_for(job["coords"]).navigation_mesh = job["navmesh"]
 
-	# Counted over every live region, not just the ones in this batch, so the
-	# totals stay right after an incremental rebuild.
+	# Totals kept per chunk and adjusted as regions are replaced. Walking every
+	# live region to re-count was another O(map) cost on an O(dig) path.
+	for job: Dictionary in _jobs:
+		if not bool(job["baked"]):
+			continue
+		var nav_mesh : NavigationMesh = job["navmesh"]
+		_region_polygons[job["coords"]] = nav_mesh.get_polygon_count()
 	polygons = 0
 	regions = 0
-	if is_instance_valid(_regions_root):
-		for child in _regions_root.get_children():
-			var region := child as NavigationRegion3D
-			if region == null or region.navigation_mesh == null:
-				continue
-			var count := region.navigation_mesh.get_polygon_count()
-			if count > 0:
-				regions += 1
-				polygons += count
+	for count: int in _region_polygons.values():
+		if count > 0:
+			regions += 1
+			polygons += count
 	publish_msec = (Time.get_ticks_usec() - start_usec) / 1000.0
 
 
@@ -816,6 +859,7 @@ func clear_regions() -> void:
 	if is_instance_valid(_regions_root):
 		_regions_root.free()
 	_regions_root = null
+	_region_polygons.clear()
 	polygons = 0
 	regions = 0
 

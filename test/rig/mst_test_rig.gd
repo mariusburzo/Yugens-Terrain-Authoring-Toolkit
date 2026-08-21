@@ -11,8 +11,19 @@ class_name MSTTestRig
 
 
 const CELL_SIZE : Vector2 = Vector2(2.0, 2.0)
+## Chunk dimensions are in vertices; the metres in the export names are
+## (dimensions.x - 1) * cell_size.x, which is the span a chunk actually covers.
 const LARGE_DIMENSIONS : Vector3i = Vector3i(33, 32, 33)
 const SMALL_DIMENSIONS : Vector3i = Vector3i(17, 32, 17)
+const TINY_DIMENSIONS : Vector3i = Vector3i(9, 32, 9)
+## Chunks per side in one bake batch on the large map.
+##
+## begin_bake() builds a single source for every job it is handed, so baking a
+## thousand chunks in one call would give each of them the whole map to filter
+## against. Batching keeps each source to a tile plus its border - which is the
+## shape a streaming implementation needs anyway. 4 x 4 is 16 chunks, one per
+## core on a typical machine.
+const LARGE_MAP_BATCH : int = 4
 const DIG_REPEATS : int = 5
 ## How many physics frames a nav query may retry before the failure is treated
 ## as a real missing connection rather than server sync latency.
@@ -28,10 +39,11 @@ const CAMERA_PAN_SPEED : float = 0.9
 const CAMERA_PAN_BOOST : float = 3.0
 const AGENT_SPEED : float = 14.0
 
-## The suite runs once per dimension setting. Turning one off halves everything
-## below it, and is the single biggest lever on how long a run takes.
-@export var run_large_dimensions : bool = true
-@export var run_small_dimensions : bool = true
+## Chunk sizes to run the suite at, as the span a chunk covers. Every selected
+## size runs the whole suite again, so this is the single biggest lever on how
+## long a run takes - and the point of selecting more than one is that chunk size
+## is the biggest lever on per-dig cost too.
+@export_flags("16 m (9x9):1", "32 m (17x17):2", "64 m (33x33):4") var chunk_sizes : int = 2
 ## Leaves the last assembled terrain in the scene with a camera so seams can be
 ## inspected by eye, and left-click digs a hole.
 @export var interactive_after_run : bool = true
@@ -93,6 +105,11 @@ const AGENT_SPEED : float = 14.0
 ## with props scattered on the floor. The only phase that answers "does the
 ## navmesh see decoration?".
 @export var run_recast_nav : bool = true
+## Phase 10: assembles a whole map at the chosen size and bakes it in tiles.
+## Slow and memory-hungry by design - it exists to find where this stops working.
+@export var run_large_map : bool = false
+## Chunks per side for phase 10. At 32 m chunks, 32 x 32 is a square kilometre.
+@export var large_map_chunks : Vector2i = Vector2i(32, 32)
 @export_group("")
 
 var _report : MSTTestReport
@@ -127,10 +144,15 @@ func _ready() -> void:
 	MSTTestNav.use_map_cell_size(self)
 	await get_tree().process_frame
 
-	if run_large_dimensions:
-		await _run_suite("33x33", LARGE_DIMENSIONS)
-	if run_small_dimensions:
-		await _run_suite("17x17", SMALL_DIMENSIONS)
+	# Smallest first: if a size is going to run out of memory on the large map,
+	# better to have the cheaper results already printed.
+	for entry: Array in [
+		[1, "9x9", TINY_DIMENSIONS],
+		[2, "17x17", SMALL_DIMENSIONS],
+		[4, "33x33", LARGE_DIMENSIONS],
+	]:
+		if chunk_sizes & int(entry[0]) != 0:
+			await _run_suite(String(entry[1]), entry[2] as Vector3i)
 
 	_report.print_all()
 
@@ -174,6 +196,8 @@ func _run_suite(suite: String, dimensions: Vector3i) -> void:
 		await _phase_nav_scale(suite, dimensions, factory)
 	if run_recast_nav:
 		await _phase_recast_nav(suite, dimensions, factory)
+	if run_large_map:
+		await _phase_large_map(suite, dimensions, factory)
 
 	factory.close()
 
@@ -1056,7 +1080,7 @@ func _phase_recast_nav(suite: String, dimensions: Vector3i, factory: MSTTestModu
 	# Polled rather than waited on, so the bake really is off the frame and the
 	# main-thread figure below is not quietly including it.
 	var incremental_start := Time.get_ticks_usec()
-	baker.prepare(terrain)
+	baker.refresh_chunks([dug])
 	baker.begin_bake([dug], baker.neighbourhood(dug))
 	var frames_in_flight := 0
 	while baker.is_baking():
@@ -1246,6 +1270,216 @@ func _phase_recast_nav(suite: String, dimensions: Vector3i, factory: MSTTestModu
 			await get_tree().physics_frame
 		baker.publish()
 		_recast_baker = baker
+	_recast_terrain = terrain
+	_live_nav_terrain = terrain
+
+
+# How big a map this recipe actually carries.
+#
+# Everything before this measures a 25-chunk cave. This assembles a real one -
+# 1024 chunks is a square kilometre at 32 m per chunk - and asks which numbers
+# stay flat and which do not.
+#
+# The bake runs in tiles, each sourcing only its own neighbourhood. begin_bake()
+# builds one source for every job it is given, so baking all 1024 in one call
+# would hand each chunk a source carrying the whole map to filter against. That
+# is the shape a streaming implementation would need anyway.
+func _phase_large_map(suite: String, dimensions: Vector3i, factory: MSTTestModules) -> void:
+	if is_instance_valid(_live_nav_terrain):
+		_live_nav_terrain.queue_free()
+		_live_nav_terrain = null
+	if is_instance_valid(_live_props):
+		_live_props.queue_free()
+		_live_props = null
+	if is_instance_valid(_live_statics):
+		_live_statics.queue_free()
+		_live_statics = null
+	for _i in range(2):
+		await get_tree().physics_frame
+
+	var size := Vector2i(maxi(large_map_chunks.x, 1), maxi(large_map_chunks.y, 1))
+	var chunk_span := float(dimensions.x - 1) * CELL_SIZE.x
+	var total := size.x * size.y
+	_report.add_note("[%s] Large map: %d x %d chunks of %.0f m = %.2f x %.2f km (%.2f km2), %d chunks." % [
+		suite, size.x, size.y, chunk_span,
+		float(size.x) * chunk_span / 1000.0, float(size.y) * chunk_span / 1000.0,
+		float(size.x) * chunk_span * float(size.y) * chunk_span / 1000000.0, total
+	])
+	var memory_before := Performance.get_monitor(Performance.MEMORY_STATIC)
+
+	var terrain : MarchingSquaresTerrain = await MSTTestAssembler.make_terrain(
+		dimensions, CELL_SIZE, self, "LargeMap_%s" % suite, enable_terrain_lod)
+	# Parked clear of every other terrain in the scene, in both axes.
+	terrain.position = Vector3(-chunk_span * float(size.x) - chunk_span * 4.0, 0.0, 0.0)
+
+	# --- assembly, yielding so the window stays alive ------------------------
+	var layout := MSTTestAssembler.build_layout(size)
+	var keys : Array = layout.keys()
+	var assemble_start := Time.get_ticks_usec()
+	for index in range(keys.size()):
+		var coords : Vector2i = keys[index]
+		MSTTestAssembler.attach_one(terrain, coords, int(layout[coords]), factory)
+		if index % 128 == 127:
+			print("[rig] large map: %d/%d chunks assembled" % [index + 1, total])
+			await get_tree().process_frame
+	var assemble_msec := (Time.get_ticks_usec() - assemble_start) / 1000.0
+	_report.add_timing(suite, "10-large-map", "assemble %d chunks" % total, assemble_msec,
+		"%.2f ms per chunk, no cell geometry warmed" % (assemble_msec / float(total)))
+	MSTTestAssembler.refresh_lod(terrain)
+
+	# Deliberately no warm_chunks() pass. A Recast bake reads the collision
+	# proxies that came with the baked module data, so cell geometry is only
+	# needed for digging - at 69 ms per chunk it would be the single largest
+	# cost here and none of it would reach the navmesh.
+	var props_start := Time.get_ticks_usec()
+	var props := MSTTestProps.scatter(terrain, PROPS_PER_CHUNK, self)
+	var statics := MSTTestStatics.scatter_bridges(terrain, self)
+	var scatter_msec := (Time.get_ticks_usec() - props_start) / 1000.0
+	_live_props = props
+	_live_statics = statics
+	var prop_centres := MSTTestProps.centres(props)
+	_report.add_timing(suite, "10-large-map", "scatter decoration", scatter_msec,
+		"%d props + %d bridges over %d chunks" % [
+			prop_centres.size(), MSTTestStatics.under_deck_points(statics).size(), total
+		])
+
+	# --- prepare, group, carve ----------------------------------------------
+	var baker := _make_recast_baker()
+	baker.border_size = baker.recommended_border()
+	baker.parse_sources([props, statics])
+	baker.prepare(terrain)
+	baker.register_chunk_groups([props, statics])
+	var static_roots : Array = [statics] if recast_props_as_obstructions else [statics, props]
+	baker.register_statics(static_roots)
+	_recast_obstructions = _build_obstructions(baker, props)
+	baker.obstructions = _recast_obstructions
+	_report.add_timing(suite, "10-large-map", "prepare + group %d chunks" % total,
+		baker.prepare_msec, "%d obstructions, %.0f m border" % [
+			_recast_obstructions.size(), baker.border_size
+		])
+
+	# --- batched bake --------------------------------------------------------
+	var batch_side := LARGE_MAP_BATCH
+	var bake_msec := 0.0
+	var source_msec := 0.0
+	var publish_msec := 0.0
+	var batches := 0
+	var bake_start := Time.get_ticks_usec()
+	for batch_z in range(0, size.y, batch_side):
+		for batch_x in range(0, size.x, batch_side):
+			var tile : Array = []
+			var sources : Dictionary = {}
+			for z in range(batch_z, mini(batch_z + batch_side, size.y)):
+				for x in range(batch_x, mini(batch_x + batch_side, size.x)):
+					var coords := Vector2i(x, z)
+					tile.append(coords)
+					for neighbour: Vector2i in baker.neighbourhood(coords):
+						sources[neighbour] = true
+			if tile.is_empty():
+				continue
+			baker.begin_bake(tile, sources.keys())
+			baker.end_bake()
+			baker.publish()
+			source_msec += baker.assemble_msec
+			bake_msec += baker.bake_msec
+			publish_msec += baker.publish_msec
+			batches += 1
+			if batches % 4 == 0:
+				print("[rig] large map: %d/%d chunks baked" % [
+					mini(batches * batch_side * batch_side, total), total
+				])
+				await get_tree().process_frame
+	var bake_total_msec := (Time.get_ticks_usec() - bake_start) / 1000.0
+
+	_report.add_timing(suite, "10-large-map", "build source, %d batches" % batches, source_msec,
+		"%d chunks per batch plus a border" % (batch_side * batch_side))
+	_report.add_timing(suite, "10-large-map", "bake %d chunks on the pool" % total, bake_msec,
+		"%.2f ms per chunk" % (bake_msec / float(total)))
+	_report.add_timing(suite, "10-large-map", "publish %d regions" % baker.regions, publish_msec,
+		"%d polygons total" % baker.polygons)
+	_report.add_timing(suite, "10-large-map", "whole map, wall clock", bake_total_msec,
+		"source + bake + publish + frame yields")
+
+	var memory_after := Performance.get_monitor(Performance.MEMORY_STATIC)
+	_report.add_timing(suite, "10-large-map", "static memory used", 0.0,
+		"%.0f MB before, %.0f MB after, %.1f MB per chunk" % [
+			memory_before / 1048576.0, memory_after / 1048576.0,
+			(memory_after - memory_before) / 1048576.0 / float(total)
+		])
+
+	# --- does a map this size still answer queries? -------------------------
+	var far := Vector2i(size.x - 1, size.y - 1)
+	var from := MSTTestNav.chunk_centre(terrain, Vector2i(0, 0)) + terrain.position
+	var to := MSTTestNav.chunk_centre(terrain, far) + terrain.position
+	var crossed : Dictionary = await MSTTestNav.try_path_until(terrain, from, to, get_tree(), MAX_NAV_SYNC_FRAMES)
+	_report.add_timing(suite, "10-large-map", "frames until a cross-map path works",
+		float(crossed["attempts"]), "physics frames" if bool(crossed["reached"]) else "never succeeded")
+	_report.add_claim(
+		"large-map-queryable",
+		"[%s] A %d-chunk map still answers a corner-to-corner query" % [suite, total],
+		bool(crossed["reached"]),
+		"%d regions, %d polygons; %d attempt(s), %d points, ended %.2f m from a target %.0f m away" % [
+			crossed["regions"], baker.polygons, crossed["attempts"], crossed["points"],
+			crossed["end_distance"], from.distance_to(to)
+		]
+	)
+
+	# A corner-to-corner query failing says nothing about where it stops. This
+	# walks outward until one does, which is the number that decides how much of
+	# the map an agent can be asked to cross in one query.
+	var reach := 0
+	for step in range(1, size.x):
+		var probe := MSTTestNav.chunk_centre(terrain, Vector2i(step, 0)) + terrain.position
+		if not bool(MSTTestNav.try_path(terrain, from, probe)["reached"]):
+			break
+		reach = step
+	_report.add_timing(suite, "10-large-map", "path reach along one edge", float(reach),
+		"chunks, i.e. %.0f m of a %.0f m edge, before a query stops arriving" % [
+			float(reach) * chunk_span, float(size.x) * chunk_span
+		])
+
+	var query_total := 0.0
+	for _i in range(3):
+		query_total += float(MSTTestNav.query_msec(terrain, from, to)["msec"])
+	_report.add_timing(suite, "10-large-map", "cross-map path query (mean of 3)", query_total / 3.0,
+		"%.0f m apart" % from.distance_to(to))
+	_report.add_timing(suite, "10-large-map", "map_force_update with %d regions" % baker.regions,
+		MSTTestNav.force_update_msec(terrain), "synchronous, lands on the main thread")
+
+	# --- the number that decides whether it is playable ----------------------
+	var middle := Vector2i(size.x / 2, size.y / 2)
+	var rock_offset := MSTTestModules.PASSAGE_HALF_WIDTH + 3
+	var stride_x := dimensions.x - 1
+	var stride_z := dimensions.z - 1
+	var site := Vector2i(
+		middle.x * stride_x + floori(dimensions.x / 2.0) + rock_offset,
+		middle.y * stride_z + floori(dimensions.z / 2.0) + rock_offset
+	)
+	MSTTestDig.dig_area(terrain, site, Vector2i(2, 2), MSTTestModules.FLOOR_HEIGHT, true)
+	MSTTestThreadedDig.rebuild_lod_proxies(terrain, [middle])
+
+	baker.refresh_chunks([middle])
+	baker.begin_bake([middle], baker.neighbourhood(middle))
+	while baker.is_baking():
+		await get_tree().process_frame
+	baker.end_bake()
+	baker.publish()
+	_report.add_timing(suite, "10-large-map", "re-bake 1 chunk of %d after a dig" % total,
+		baker.main_thread_msec(),
+		"prepare %.2f + source %.2f + publish %.2f; worker did %.2f" % [
+			baker.prepare_msec, baker.assemble_msec, baker.publish_msec, baker.bake_msec
+		])
+	_report.add_claim(
+		"large-map-dig-loop",
+		"[%s] Re-baking one chunk stays under 5 ms on the main thread with %d regions live" % [suite, baker.regions],
+		baker.main_thread_msec() < 5.0,
+		"main thread %.2f ms = refresh %.2f + source %.2f + publish %.2f, with %d chunks and %d obstructions on the map" % [
+			baker.main_thread_msec(), baker.prepare_msec, baker.assemble_msec,
+			baker.publish_msec, baker.chunk_coords().size(), _recast_obstructions.size()
+		]
+	)
+
+	_recast_baker = baker
 	_recast_terrain = terrain
 	_live_nav_terrain = terrain
 
@@ -1461,8 +1695,8 @@ func _dig_at_screen_position(screen_position: Vector2) -> void:
 			for neighbour: Vector2i in _recast_baker.neighbourhood(coords):
 				source_coords[neighbour] = true
 		# swap_collision_shape() put a new shape resource on each dug chunk, so
-		# the references cached by the last prepare() are stale.
-		_recast_baker.prepare(terrain)
+		# the references cached for those chunks are stale. Only those.
+		_recast_baker.refresh_chunks(dug)
 		_recast_baker.begin_bake(dug, source_coords.keys())
 		while _recast_baker.is_baking():
 			await get_tree().process_frame

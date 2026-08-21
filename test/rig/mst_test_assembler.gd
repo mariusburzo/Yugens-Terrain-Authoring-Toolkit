@@ -41,8 +41,13 @@ static func assemble_naive(terrain: MarchingSquaresTerrain, layout: Dictionary, 
 
 static func assemble_fast(terrain: MarchingSquaresTerrain, layout: Dictionary, factory: MSTTestModules) -> void:
 	for coords: Vector2i in layout.keys():
-		var chunk := _prepare_chunk(terrain, int(layout[coords]), factory)
-		attach_fast(terrain, coords, chunk)
+		attach_one(terrain, coords, int(layout[coords]), factory)
+
+
+## One chunk, so a caller assembling thousands can yield to the tree between
+## batches instead of blocking for the whole build.
+static func attach_one(terrain: MarchingSquaresTerrain, coords: Vector2i, mask: int, factory: MSTTestModules) -> void:
+	attach_fast(terrain, coords, _prepare_chunk(terrain, mask, factory))
 
 
 static func _prepare_chunk(terrain: MarchingSquaresTerrain, mask: int, factory: MSTTestModules) -> MarchingSquaresTerrainChunk:
