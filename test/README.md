@@ -96,6 +96,38 @@ intended — 13106 triangles down to 4518, precisely 9/25 — but the scoped sou
 source**, at ~266 triangles each, because the parser tessellates their `CylinderShape3D` and
 `BoxShape3D` colliders. That is what per-chunk groups and projected obstructions attack.
 
+**The navigation map's edge-connection margin is what made a big map unusable.** With it on,
+a one-chunk re-bake on a 1024-region map never published within 60 physics frames and took
+tens of seconds by observation; with it off the map publishes promptly and agents re-path
+immediately. The margin exists to join regions whose edges do not line up, so the server
+searches for neighbours across every free edge on the map - ~300k at 106k polygons - and that
+cost scales with the whole map rather than with what changed. The chunked-navmesh demo
+disables it in one line with a two-line comment; at 25 regions that looked like a
+micro-optimisation, and at 1024 it is the difference between working and not.
+
+It is not free. With it off, regions connect **only** where their edges match exactly. That
+holds here by construction - `border_size` trimming lands chunk boundaries on identical
+coordinates and vertices are snapped to the map grid - but a hand-placed region, an imported
+navmesh, or one baked at a different `cell_size` will silently fail to join rather than
+erroring. `recast-seams` and `nav-seam-connect` are the tripwires.
+
+**A rebaked navmesh is visible before it is walkable, and agents lag further still.** Two
+separate delays, and only one is about map size:
+
+- Assigning `region.navigation_mesh` updates the *resource*, which is what the debug draw
+  renders. The map rebuilds its pathfinding structure separately and swaps it in when ready,
+  bumping `map_get_iteration_id()`. In between, the hole is on screen and `map_get_path()`
+  still answers from the previous iteration. `map_force_update()` does not close this gap
+  reliably at scale. The interactive log now prints how many physics frames it took.
+- `NavigationAgent3D` caches the path it is walking and does not watch the map. An agent
+  mid-route keeps following a path computed before the change - through a wall that now
+  exists, or around a prop that is gone - until its target changes or it arrives. Nothing
+  re-paths it automatically; re-assigning `target_position` is what does. The rig now nudges
+  the walker after every dig and chop and reports the point count either side.
+
+Both matter for a game with live editing: an agent will keep walking through the world as it
+was when it last asked, and a re-bake alone does not tell it otherwise.
+
 **A square kilometre works, but pathfinding does not reach across it.** 1024 chunks of
 32 m, 1024 regions, **105992 polygons**. A corner-to-corner query over 1403 m returns a
 partial path that stops ~340 m along, and walking outward one chunk at a time puts the

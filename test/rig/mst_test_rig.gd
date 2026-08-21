@@ -29,6 +29,13 @@ const DIG_REPEATS : int = 5
 ## as a real missing connection rather than server sync latency.
 const MAX_NAV_SYNC_FRAMES : int = 60
 const NAV_SETTLE_FRAMES : int = 20
+## How long to watch for the navigation map to publish a change before giving up.
+##
+## Deliberately much larger than MAX_NAV_SYNC_FRAMES: at 1024 regions the map was
+## measured taking longer than a second, so a budget sized for a query retry
+## reports "never" for something that does eventually arrive. The point is to get
+## the real number, not a verdict.
+const MAX_NAV_PUBLISH_FRAMES : int = 900
 const NAV_SCALE_GRID : int = 5
 const RECAST_NAV_GRID : int = 5
 ## Props per chunk in the Recast phase. Enough that a missed one is obvious in
@@ -81,6 +88,27 @@ const AGENT_SPEED : float = 14.0
 ## climb-test band should start blocking. Props are masked out of the parsed
 ## geometry by collision layer so they are not represented twice.
 @export var recast_props_as_obstructions : bool = false
+## Leave the navigation map's edge-connection margin switched on.
+##
+## Off is what the chunked-navmesh demo does, and its reasoning applies here:
+## the margin exists to join regions whose edges do not line up, and every region
+## this rig produces is edge-aligned by construction - that is what border_size
+## trimming and vertex snapping are for. The feature is documented as costly, and
+## it searches for neighbours across every free edge on the map, so its cost
+## grows with total polygons rather than with what changed.
+##
+## Suspected cause of the map taking over a second to publish a change at 1024
+## regions. Turning it on is the A/B; the seam claims are the tripwire if the
+## regions turn out to need it after all.
+@export var nav_edge_connections : bool = false
+## Chunks either side of the walker whose nav regions stay enabled. 0 keeps them
+## all enabled, which is what a 1024-region map does today.
+##
+## A disabled region leaves the navigation map, so this bounds both costs that
+## grow with map size: what the server re-syncs when anything changes, and the
+## polygon graph A* searches. Re-applied when the walker crosses into a new
+## chunk, which is what a game would do.
+@export_range(0, 64, 1) var nav_active_radius_chunks : int = 0
 
 ## Phases, in the order they run. Every one builds its own terrain from scratch,
 ## so switching off the ones you are not reading is a straight saving - the only
@@ -124,6 +152,8 @@ var _dig_count : int = 0
 var _dig_in_flight : bool = false
 var _agent_body : Node3D
 var _agent : NavigationAgent3D
+var _agent_target : Vector3 = Vector3.INF
+var _active_nav_centre : Vector2i = Vector2i(-9999, -9999)
 var _live_props : Node3D
 var _live_statics : Node3D
 var _recast_baker : MSTTestRecastNav
@@ -142,6 +172,12 @@ func _ready() -> void:
 	# front, so a project that overrides navigation/3d/default_cell_size is
 	# followed rather than assumed away.
 	MSTTestNav.use_map_cell_size(self)
+	var map := get_world_3d().navigation_map
+	NavigationServer3D.map_set_use_edge_connections(map, nav_edge_connections)
+	_report.add_note("Navigation map edge connections %s (margin %.2f)." % [
+		"ON" if nav_edge_connections else "OFF - regions must meet by exact edge match",
+		NavigationServer3D.map_get_edge_connection_margin(map)
+	])
 	await get_tree().process_frame
 
 	# Smallest first: if a size is going to run out of memory on the large map,
@@ -1424,6 +1460,35 @@ func _phase_large_map(suite: String, dimensions: Vector3i, factory: MSTTestModul
 		]
 	)
 
+	# How long the map takes to publish a change is the number that decides
+	# whether an agent notices a dig. Measured by re-baking one chunk and waiting
+	# for the iteration id to move.
+	var publish_probe := Vector2i(mini(1, size.x - 1), mini(1, size.y - 1))
+	var publish_all : Dictionary = await _measure_nav_publish(terrain, baker, publish_probe)
+	_report.add_timing(suite, "10-large-map", "map publishes a change, %d regions" % baker.regions,
+		float(publish_all["msec"]),
+		"%d physics frames%s" % [
+			publish_all["frames"],
+			"" if bool(publish_all["published"]) else " - never, within %d" % MAX_NAV_PUBLISH_FRAMES
+		])
+
+	# The same measurement with only a working set enabled. A disabled region is
+	# off the map, so this is the lever for both sync cost and A* search space.
+	if nav_active_radius_chunks > 0:
+		var active := baker.set_active_radius(publish_probe, nav_active_radius_chunks)
+		for _i in range(NAV_SETTLE_FRAMES):
+			await get_tree().physics_frame
+		var publish_windowed : Dictionary = await _measure_nav_publish(terrain, baker, publish_probe)
+		_report.add_timing(suite, "10-large-map", "map publishes a change, %d enabled" % active,
+			float(publish_windowed["msec"]),
+			"%d physics frames, radius %d chunks; vs %.0f ms with all %d enabled" % [
+				publish_windowed["frames"], nav_active_radius_chunks,
+				publish_all["msec"], baker.regions
+			])
+		baker.set_active_radius(publish_probe, -1)
+		for _i in range(NAV_SETTLE_FRAMES):
+			await get_tree().physics_frame
+
 	# A corner-to-corner query failing says nothing about where it stops. This
 	# walks outward until one does, which is the number that decides how much of
 	# the map an agent can be asked to cross in one query.
@@ -1554,6 +1619,7 @@ func _setup_camera() -> void:
 
 func _process(delta: float) -> void:
 	_move_agent(delta)
+	_update_active_nav_window()
 	if not is_instance_valid(_camera):
 		return
 
@@ -1715,6 +1781,7 @@ func _dig_at_screen_position(screen_position: Vector2) -> void:
 			nav_regions += 1
 		if nav_regions > 0:
 			nav_main_msec = (Time.get_ticks_usec() - nav_start) / 1000.0
+	var iteration_before := MSTTestNav.map_iteration(terrain)
 	if nav_regions > 0 and NavigationServer3D.has_method("map_force_update"):
 		NavigationServer3D.map_force_update(terrain.get_world_3d().navigation_map)
 
@@ -1729,6 +1796,15 @@ func _dig_at_screen_position(screen_position: Vector2) -> void:
 		job.worker_msec, job.frames_in_flight, nav_worker_msec, nav_regions, job.frames_without_collision
 	])
 	_dig_in_flight = false
+
+	var published : Dictionary = await _await_nav_iteration(terrain, iteration_before)
+	print("[rig]   map published the change after %d physics frame(s), %.1f ms, over %d region(s) with edge connections %s%s" % [
+		published["frames"], published["msec"],
+		NavigationServer3D.map_get_regions(get_world_3d().navigation_map).size(),
+		"ON" if nav_edge_connections else "OFF",
+		"" if bool(published["published"]) else " - NOT published within the budget"
+	])
+	await _repath_agent()
 
 
 ## A red cube driven by a NavigationAgent3D, so the merged navmesh can be seen
@@ -1767,6 +1843,24 @@ func _spawn_agent() -> void:
 	_agent_body.add_child(_agent)
 
 
+## Moves the enabled-region window with the walker, and only when it actually
+## crosses into a new chunk - the update is O(regions) and would otherwise be a
+## per-frame cost of exactly the kind this is meant to remove.
+func _update_active_nav_window() -> void:
+	if nav_active_radius_chunks <= 0 or _recast_baker == null:
+		return
+	if not is_instance_valid(_agent_body) or not is_instance_valid(_recast_terrain):
+		return
+	var centre := _recast_baker.chunk_coords_for(_agent_body.global_position)
+	if centre == _active_nav_centre:
+		return
+	_active_nav_centre = centre
+	var active := _recast_baker.set_active_radius(centre, nav_active_radius_chunks)
+	print("[rig]   nav window moved to chunk %s: %d region(s) enabled of %d" % [
+		str(centre), active, _recast_baker.chunk_coords().size()
+	])
+
+
 func _move_agent(delta: float) -> void:
 	if not is_instance_valid(_agent) or not is_instance_valid(_agent_body):
 		return
@@ -1782,6 +1876,7 @@ func _move_agent(delta: float) -> void:
 func _send_agent_to(target: Vector3) -> void:
 	if not is_instance_valid(_agent):
 		return
+	_agent_target = target
 	_agent.target_position = target
 	# The path is computed against the map, so read it back rather than trusting
 	# the click: an unreachable target still produces a partial path.
@@ -1811,6 +1906,60 @@ func _build_obstructions(baker: MSTTestRecastNav, props: Node3D) -> Array:
 ## how they reach the bake, not in what removing one costs. A prop leaves the
 ## obstruction list; a bridge leaves its chunk's static group. Neither touches
 ## the terrain.
+## Re-bakes one chunk and times how long the map takes to answer with it.
+func _measure_nav_publish(terrain: MarchingSquaresTerrain, baker: MSTTestRecastNav, coords: Vector2i) -> Dictionary:
+	baker.refresh_chunks([coords])
+	baker.begin_bake([coords], baker.neighbourhood(coords))
+	while baker.is_baking():
+		await get_tree().process_frame
+	baker.end_bake()
+	var before := MSTTestNav.map_iteration(terrain)
+	baker.publish()
+	if NavigationServer3D.has_method("map_force_update"):
+		NavigationServer3D.map_force_update(terrain.get_world_3d().navigation_map)
+	return await _await_nav_iteration(terrain, before)
+
+
+## Waits for the navigation map to publish a new iteration, and says how long it
+## took. This is the gap between "the debug draw shows the change" and "a query
+## answers with it".
+func _await_nav_iteration(terrain: MarchingSquaresTerrain, before: int) -> Dictionary:
+	if before < 0:
+		return {"frames": -1, "msec": 0.0, "published": false}
+	var start_usec := Time.get_ticks_usec()
+	for frame in range(MAX_NAV_PUBLISH_FRAMES):
+		if MSTTestNav.map_iteration(terrain) != before:
+			return {
+				"frames": frame,
+				"msec": (Time.get_ticks_usec() - start_usec) / 1000.0,
+				"published": true,
+			}
+		await get_tree().physics_frame
+	return {
+		"frames": MAX_NAV_PUBLISH_FRAMES,
+		"msec": (Time.get_ticks_usec() - start_usec) / 1000.0,
+		"published": false,
+	}
+
+
+## Makes the walker notice that the map changed under it.
+##
+## NavigationAgent3D holds the path it is following and does not watch the map,
+## so an agent mid-route keeps walking a path computed before the dig - through
+## a wall that now exists, or around a prop that no longer does. Re-assigning the
+## target is what forces it to ask again. Nothing does this automatically.
+func _repath_agent() -> void:
+	if not is_instance_valid(_agent) or _agent_target == Vector3.INF:
+		return
+	if _agent.is_navigation_finished():
+		return
+	var before := _agent.get_current_navigation_path().size()
+	_agent.target_position = _agent_target
+	await get_tree().physics_frame
+	var after := _agent.get_current_navigation_path().size()
+	print("[rig]   walker re-pathed: %d -> %d point(s)" % [before, after])
+
+
 func _prop_from_collider(collider: Variant) -> Node3D:
 	var node := collider as Node
 	while node != null:
@@ -1872,6 +2021,7 @@ func _destroy_prop(prop: Node3D) -> void:
 	_recast_baker.publish()
 	var main_msec := _recast_baker.assemble_msec + _recast_baker.publish_msec + maxf(reparse_msec, 0.0)
 
+	var iteration_before := MSTTestNav.map_iteration(_recast_terrain)
 	if NavigationServer3D.has_method("map_force_update"):
 		NavigationServer3D.map_force_update(_recast_terrain.get_world_3d().navigation_map)
 
@@ -1886,6 +2036,15 @@ func _destroy_prop(prop: Node3D) -> void:
 		_recast_baker.bake_msec, frames
 	])
 	_dig_in_flight = false
+
+	var published : Dictionary = await _await_nav_iteration(_recast_terrain, iteration_before)
+	print("[rig]   map published the change after %d physics frame(s), %.1f ms, over %d region(s) with edge connections %s%s" % [
+		published["frames"], published["msec"],
+		NavigationServer3D.map_get_regions(get_world_3d().navigation_map).size(),
+		"ON" if nav_edge_connections else "OFF",
+		"" if bool(published["published"]) else " - NOT published within the budget"
+	])
+	await _repath_agent()
 
 
 func _terrain_from_collider(collider: Variant) -> MarchingSquaresTerrain:

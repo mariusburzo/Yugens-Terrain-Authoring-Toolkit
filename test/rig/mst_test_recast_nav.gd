@@ -855,6 +855,34 @@ func publish() -> void:
 	publish_msec = (Time.get_ticks_usec() - start_usec) / 1000.0
 
 
+## Enables only the regions within `radius` chunks of `centre`, disabling the
+## rest. A negative radius enables everything.
+##
+## A disabled region leaves the navigation map entirely, so this shrinks both
+## things that scale with map size: the sync the server does when anything
+## changes, and the polygon graph A* has to search. The cost is that an agent
+## cannot path into what is switched off - the working set has to cover wherever
+## anyone might need to go, not just what is on screen.
+##
+## O(regions), so call it when the centre chunk changes, not every frame.
+func set_active_radius(centre: Vector2i, radius: int) -> int:
+	if not is_instance_valid(_regions_root):
+		return 0
+	var active := 0
+	for coords: Vector2i in _chunk_geometry.keys():
+		var region := _regions_root.get_node_or_null(
+			"%s_%d_%d" % [REGION_NAME, coords.x, coords.y]) as NavigationRegion3D
+		if region == null:
+			continue
+		var wanted := radius < 0 or (
+			absi(coords.x - centre.x) <= radius and absi(coords.y - centre.y) <= radius)
+		if region.enabled != wanted:
+			region.enabled = wanted
+		if wanted:
+			active += 1
+	return active
+
+
 func clear_regions() -> void:
 	if is_instance_valid(_regions_root):
 		_regions_root.free()

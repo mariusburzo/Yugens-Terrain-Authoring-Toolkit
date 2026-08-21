@@ -188,6 +188,22 @@ static func try_path(terrain: MarchingSquaresTerrain, from: Vector3, to: Vector3
 	}
 
 
+## Which iteration of its pathfinding data the map is currently answering from.
+##
+## Assigning region.navigation_mesh updates the resource, and that is what the
+## debug draw renders. The map rebuilds its own pathfinding structure separately
+## and swaps it in when ready, bumping this id. Between the two, the navmesh can
+## look correct on screen while map_get_path() still answers from the previous
+## iteration - a hole that is visibly dug but not yet walkable, or a prop that is
+## gone but still routed around.
+##
+## Returns -1 when the build predates map_get_iteration_id().
+static func map_iteration(terrain: MarchingSquaresTerrain) -> int:
+	if not NavigationServer3D.has_method("map_get_iteration_id"):
+		return -1
+	return NavigationServer3D.map_get_iteration_id(terrain.get_world_3d().navigation_map)
+
+
 ## Cost of a synchronous map update on its own. This is the part that lands on
 ## the main thread after a region changes, so it is the number that decides
 ## whether a dig in a large cave stalls the frame.
