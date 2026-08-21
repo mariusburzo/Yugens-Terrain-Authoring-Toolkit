@@ -161,14 +161,22 @@ static func obstructions(root: Node3D, margin: float = 0.0) -> Array:
 	return result
 
 
-## Distance from each prop's floor centre to the nearest point the navigation map
-## considers walkable.
+## How far the navigation map is pushed away from each prop, measured on the xz
+## plane, plus how far above the sample the returned point sat.
 ##
-## Near zero means the builder never noticed the prop. A value at or beyond the
-## agent radius means the navmesh was carved around it.
+## Horizontal and vertical are reported separately because a Recast navmesh does
+## not lie on the surface it was baked from - measured at ~0.5 m above the floor
+## here, roughly two cell_heights, from the voxel rounding in the poly mesh. A 3D
+## distance therefore carries that offset as a floor it can never go below, which
+## made "is this point on the navmesh?" impossible to answer: every sample looked
+## at least 0.5 m away from walkable ground even when standing right on it.
+##
+## Horizontal near zero means the builder never noticed the prop. At or beyond
+## the agent radius means the navmesh was carved around it.
 static func nav_clearance(terrain: MarchingSquaresTerrain, prop_centres: Array) -> Dictionary:
 	if prop_centres.is_empty():
-		return {"count": 0, "min": 0.0, "mean": 0.0, "max": 0.0, "on_navmesh": 0, "mean_y": 0.0, "above_floor": 0}
+		return {"count": 0, "min": 0.0, "mean": 0.0, "max": 0.0, "on_navmesh": 0, "mean_y": 0.0,
+			"above_floor": 0, "mean_rise": 0.0}
 	var map := terrain.get_world_3d().navigation_map
 	var total := 0.0
 	var smallest := INF
@@ -179,13 +187,17 @@ static func nav_clearance(terrain: MarchingSquaresTerrain, prop_centres: Array) 
 	var on_navmesh := 0
 	var above_floor := 0
 	var y_total := 0.0
+	var rise_total := 0.0
 	for centre: Vector3 in prop_centres:
 		var closest := NavigationServer3D.map_get_closest_point(map, centre)
-		var distance := closest.distance_to(centre)
+		# xz only. The navmesh sits above the surface by a fixed amount that has
+		# nothing to do with whether this spot is walkable.
+		var distance := Vector2(closest.x - centre.x, closest.z - centre.z).length()
 		total += distance
 		smallest = minf(smallest, distance)
 		largest = maxf(largest, distance)
 		y_total += closest.y
+		rise_total += closest.y - centre.y
 		if distance < 0.1:
 			on_navmesh += 1
 		if closest.y - centre.y > 1.0:
@@ -198,6 +210,7 @@ static func nav_clearance(terrain: MarchingSquaresTerrain, prop_centres: Array) 
 		"on_navmesh": on_navmesh,
 		"above_floor": above_floor,
 		"mean_y": y_total / float(prop_centres.size()),
+		"mean_rise": rise_total / float(prop_centres.size()),
 	}
 
 

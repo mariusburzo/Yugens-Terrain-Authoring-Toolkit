@@ -934,6 +934,9 @@ func _phase_recast_nav(suite: String, dimensions: Vector3i, factory: MSTTestModu
 			suite, builder[0], figures["on_navmesh"], figures["count"], figures["above_floor"],
 			figures["mean_y"], MSTTestModules.FLOOR_HEIGHT, MSTTestModules.WALL_HEIGHT
 		])
+		_report.add_note("[%s] %s: navmesh sits %.2f m above the sample point on average - Recast does not lay its polygons on the surface it baked from, so clearance figures here are xz only." % [
+			suite, builder[0], figures["mean_rise"]
+		])
 
 	# Split by prop kind, because the interesting variable is height. A prop whose
 	# top sits below the baker's effective climb is stepped onto rather than
@@ -970,9 +973,9 @@ func _phase_recast_nav(suite: String, dimensions: Vector3i, factory: MSTTestModu
 			"recast-walk-under-bridge",
 			"[%s] The floor under a bridge deck stays walkable" % suite,
 			int(under["on_navmesh"]) * 5 >= under_deck.size() * 4,
-			"%d of %d bridge undersides sit on navmesh; clearance min/mean/max %.2f/%.2f/%.2f m, closest point averages y=%.2f with the deck at %.1f m" % [
+			"%d of %d bridge undersides sit on navmesh; horizontal clearance min/mean/max %.2f/%.2f/%.2f m, navmesh %.2f m above the floor, deck at %.1f m" % [
 				under["on_navmesh"], under_deck.size(),
-				under["min"], under["mean"], under["max"], under["mean_y"],
+				under["min"], under["mean"], under["max"], under["mean_rise"],
 				MSTTestStatics.DECK_CLEARANCE
 			]
 		)
@@ -1546,10 +1549,16 @@ func _build_obstructions(baker: MSTTestRecastNav, props: Node3D) -> Array:
 	return list
 
 
+## Anything left-click can destroy: decoration or an irregular static.
+##
+## Both are handled by the same path because the difference between them lives in
+## how they reach the bake, not in what removing one costs. A prop leaves the
+## obstruction list; a bridge leaves its chunk's static group. Neither touches
+## the terrain.
 func _prop_from_collider(collider: Variant) -> Node3D:
 	var node := collider as Node
 	while node != null:
-		if node.is_in_group(MSTTestProps.GROUP):
+		if node.is_in_group(MSTTestProps.GROUP) or node.is_in_group(MSTTestStatics.GROUP):
 			return node as Node3D
 		node = node.get_parent()
 	return null
@@ -1573,6 +1582,7 @@ func _destroy_prop(prop: Node3D) -> void:
 	_dig_in_flight = true
 	_dig_count += 1
 	var prop_name := String(prop.name)
+	var is_static := prop.is_in_group(MSTTestStatics.GROUP)
 	var coords := _recast_baker.chunk_coords_for(prop.global_position)
 
 	var start_usec := Time.get_ticks_usec()
@@ -1590,7 +1600,14 @@ func _destroy_prop(prop: Node3D) -> void:
 		_recast_obstructions = _build_obstructions(_recast_baker, _live_props)
 		_recast_baker.obstructions = _recast_obstructions
 
-	_recast_baker.begin_bake([coords], _recast_baker.neighbourhood(coords))
+	# A bridge deck is long enough to reach past its own chunk, so what it was
+	# removed from is not necessarily the only chunk whose navmesh changed.
+	var affected : Array = [coords] if not is_static else _recast_baker.neighbourhood(coords)
+	var sources : Dictionary = {}
+	for chunk_coords: Vector2i in affected:
+		for neighbour: Vector2i in _recast_baker.neighbourhood(chunk_coords):
+			sources[neighbour] = true
+	_recast_baker.begin_bake(affected, sources.keys())
 	var frames := 0
 	while _recast_baker.is_baking():
 		frames += 1
@@ -1602,8 +1619,10 @@ func _destroy_prop(prop: Node3D) -> void:
 	if NavigationServer3D.has_method("map_force_update"):
 		NavigationServer3D.map_force_update(_recast_terrain.get_world_3d().navigation_map)
 
-	print("[rig] chop %d: %s on chunk %s, navmesh only: MAIN THREAD %.2f ms = source %.2f + publish %.2f%s" % [
-		_dig_count, prop_name, str(coords), main_msec,
+	print("[rig] chop %d: %s (%s) on chunk %s, navmesh only: MAIN THREAD %.2f ms = source %.2f + publish %.2f%s" % [
+		_dig_count, prop_name,
+		"parsed static, left its chunk group" if is_static else "obstruction, left the carve list",
+		str(coords), main_msec,
 		_recast_baker.assemble_msec, _recast_baker.publish_msec,
 		"" if reparse_msec < 0.0 else " + props re-parse %.2f (cached-shapes snapshot went stale)" % reparse_msec
 	])

@@ -96,6 +96,43 @@ intended — 13106 triangles down to 4518, precisely 9/25 — but the scoped sou
 source**, at ~266 triangles each, because the parser tessellates their `CylinderShape3D` and
 `BoxShape3D` colliders. That is what per-chunk groups and projected obstructions attack.
 
+**A Recast navmesh does not lie on the surface it was baked from.** Measured at **~0.5 m**
+above the floor, consistently, at `cell_height = 0.25` - roughly two cell heights, from voxel
+rounding in the poly mesh. Harmless for agents, but it silently broke two measurements here:
+clearance was computed as a 3D distance, so every sample carried that 0.5 m as a floor it
+could never go below. "0 of 110 props stand on navmesh" and "0 of 25 bridge undersides" were
+structurally impossible results, not observations. Clearance is now measured on xz, with the
+vertical rise reported separately. Anything comparing a world position against navmesh y has
+to expect this offset.
+
+**The hybrid: three lanes, no per-chunk decision.** Terrain from cached collision proxies,
+irregular statics parsed one chunk group at a time, decoration carved as obstructions. A
+chunk's source is the union of its three lanes, and a chunk with an empty static group makes
+no parse call at all. With props as obstructions and no statics in a chunk, the hybrid
+degenerates to exactly the cached-shapes path, so it is a strict generalisation rather than
+a trade.
+
+All four modes collect identical geometry (14606 triangles, bounds centres 0.000 m apart).
+With 25 bridges and 110 props on a 25-chunk cave:
+
+| mode | full build | 9-chunk scope |
+| --- | --- | --- |
+| cached shapes | 0.49 ms / 14606 tri | 0.17 ms / 6018 tri |
+| one flat group | 0.94 ms / 14606 tri | 0.89 ms / 14606 tri |
+| per-chunk groups | 1.11 ms / 14606 tri | 0.43 ms / 5058 tri |
+| **hybrid** | **0.76 ms / 14606 tri** | **0.30 ms / 5058 tri** |
+
+Cached shapes is still fastest in raw milliseconds, but it cannot scope the parsed half -
+6018 triangles against the hybrid's 5058 - and its snapshot goes stale when a static is
+destroyed. The hybrid gets the smaller scoped source at roughly half the cost of per-chunk
+groups, because terrain never goes through a parse.
+
+**The layer choice is semantic.** Bit 3 (masked out, carved) means *always blocks*, whatever
+its height - which is what rescues the 1.2 m crates from the climb-test band. Bit 4 (parsed)
+means *physics decides*: walkable, steppable, or walk-under. A bridge on the carve layer
+would be sealed solid from the ground up, and a knee-high rock on the carve layer stops being
+steppable. Neither failure announces itself.
+
 **Projected obstructions make props free, and change which source mode to pick.** Supplying
 each prop as a footprint polygon plus an elevation and a height, with the props' collision
 layer masked out of the parse, removes them from the source entirely - `parse 110 props` drops
@@ -262,7 +299,7 @@ Controls:
 - **left-click digs** — threaded, and prints where every millisecond went, main thread
   against worker. On the `Recast_*` cave the navmesh follows with a chunked Recast re-bake
   polled across frames; everywhere else it is the merger.
-- **left-click a prop chops it down instead** — navmesh only. No height changed, so there is
+- **left-click a prop or a bridge destroys it** — navmesh only. No height changed, so there is
   no mesh, collision proxy, cell geometry or LOD proxy work, and `prepare()` is skipped
   because the cached chunk shapes are still valid. This is the case that separates the source
   modes: with `Cached shapes` the log shows an extra props re-parse, because that mode
@@ -311,7 +348,7 @@ near a chunk border there is the rig proving its point, not a defect.
 | `recast-chunk-groups-scope` | Per-chunk groups scope a parse, props included | holds |
 | `recast-sees-props` (obstruction mode) | Crates inside the climb band block too | holds |
 | `lod-survives-threaded-dig` | A threaded dig leaves every chunk a live LOD proxy | holds |
-| `recast-walk-under-bridge` | The floor under a bridge deck stays walkable | not yet measured |
+| `recast-walk-under-bridge` | The floor under a bridge deck stays walkable | holds once measured on xz; see below |
 | `recast-seams` | Chunked Recast regions meet across every seam unaided | holds |
 | `recast-parallel` | The pool bake beats the same bakes done one at a time | holds |
 | `recast-dig-loop` | Re-baking one chunk leaves under 5 ms on the main thread | holds |
