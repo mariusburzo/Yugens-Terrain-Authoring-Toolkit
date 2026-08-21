@@ -20,13 +20,13 @@ class_name MSTTestAssembler
 ## run to completion while the terrain is still empty keeps it from
 ## re-initialising pasted chunks in the middle of a measurement, and stops it
 ## resuming on a freed instance when the caller disposes of the terrain.
-static func make_terrain(dimensions: Vector3i, cell_size: Vector2, parent: Node, node_name: String) -> MarchingSquaresTerrain:
+static func make_terrain(dimensions: Vector3i, cell_size: Vector2, parent: Node, node_name: String, lod_enabled: bool = false) -> MarchingSquaresTerrain:
 	var terrain := MarchingSquaresTerrain.new()
 	terrain.name = node_name
 	terrain.dimensions = dimensions
 	terrain.cell_size = cell_size
 	terrain.bake_grass = false
-	terrain.terrain_lod_enabled = false
+	terrain.terrain_lod_enabled = lod_enabled
 	parent.add_child(terrain)
 	for _i in range(3):
 		await parent.get_tree().process_frame
@@ -71,6 +71,20 @@ static func attach_fast(terrain: MarchingSquaresTerrain, coords: Vector2i, chunk
 		coords.y * ((terrain.dimensions.z - 1) * terrain.cell_size.y)
 	)
 	chunk.initialize_terrain(false)
+
+
+## Builds the LOD proxies for a terrain assembled through attach_fast().
+##
+## add_chunk() ends with _apply_visibility_detail_settings(), which is the only
+## runtime path that reaches MSTTerrainLodController.apply(). The fast path skips
+## add_chunk() by design, so without this a fast-assembled terrain has LOD
+## switched on and no proxies to switch to.
+static func refresh_lod(terrain: MarchingSquaresTerrain) -> int:
+	if not terrain.terrain_lod_enabled:
+		return 0
+	if terrain.has_method("_apply_visibility_detail_settings"):
+		terrain._apply_visibility_detail_settings()
+	return MSTTestThreadedDig.count_lod_proxies(terrain)
 
 
 ## A rectangular layout whose sockets agree across every shared edge.

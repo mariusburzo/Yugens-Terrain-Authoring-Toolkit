@@ -46,6 +46,12 @@ const AGENT_SPEED : float = 14.0
 ## filter_baking_aabb and border_size are overwritten per chunk; whatever the
 ## resource carries for those two is ignored.
 @export var recast_bake_settings : NavigationMesh
+## Runs every measured terrain with terrain_lod_enabled on.
+##
+## Everything before this ran with LOD off, so assembly and dig timings taken
+## with it on are not directly comparable to earlier logs - the report says which
+## it was.
+@export var enable_terrain_lod : bool = true
 ## Where phase 9 gets its source geometry. See MSTTestRecastNav.SourceMode.
 ##
 ## "Cached shapes" reads each chunk's collision proxy and merges a props source
@@ -101,6 +107,7 @@ func _ready() -> void:
 	if Engine.is_editor_hint():
 		return
 	_report = MSTTestReport.new()
+	_report.add_note("terrain_lod_enabled = %s on every measured terrain." % enable_terrain_lod)
 	_setup_environment()
 	# Every builder has to agree with the navigation map about cell size, or its
 	# regions are rasterised onto a grid they were not built for. Read once, up
@@ -176,7 +183,7 @@ func _phase_assembly(suite: String, dimensions: Vector3i, factory: MSTTestModule
 		for mode: String in ["naive", "fast"]:
 			var layout := MSTTestAssembler.build_layout(Vector2i(grid_size, grid_size))
 			var terrain : MarchingSquaresTerrain = await MSTTestAssembler.make_terrain(
-				dimensions, CELL_SIZE, self, "Assembly_%s_%d_%s" % [suite, grid_size, mode])
+				dimensions, CELL_SIZE, self, "Assembly_%s_%d_%s" % [suite, grid_size, mode], enable_terrain_lod)
 
 			var start := Time.get_ticks_usec()
 			if mode == "naive":
@@ -220,8 +227,9 @@ func _phase_assembly(suite: String, dimensions: Vector3i, factory: MSTTestModule
 func _phase_seams_and_digging(suite: String, dimensions: Vector3i, factory: MSTTestModules) -> MarchingSquaresTerrain:
 	var layout := MSTTestAssembler.build_layout(Vector2i(3, 3))
 	var terrain : MarchingSquaresTerrain = await MSTTestAssembler.make_terrain(
-		dimensions, CELL_SIZE, self, "Live_%s" % suite)
+		dimensions, CELL_SIZE, self, "Live_%s" % suite, enable_terrain_lod)
 	MSTTestAssembler.assemble_fast(terrain, layout, factory)
+	MSTTestAssembler.refresh_lod(terrain)
 
 	# Nav faces are read before anything regenerates cell geometry, because that
 	# is the state a freshly assembled cave is actually in.
@@ -326,11 +334,12 @@ func _phase_navigation(suite: String, dimensions: Vector3i, factory: MSTTestModu
 		await get_tree().physics_frame
 
 	var terrain : MarchingSquaresTerrain = await MSTTestAssembler.make_terrain(
-		dimensions, CELL_SIZE, self, "Nav_%s" % suite)
+		dimensions, CELL_SIZE, self, "Nav_%s" % suite, enable_terrain_lod)
 	# Parked just north of the live terrain so both are visible at once with
 	# Debug > Visible Navigation switched on.
 	terrain.position = Vector3(0.0, 0.0, -float(dimensions.z - 1) * CELL_SIZE.y * 2.0)
 	MSTTestAssembler.assemble_fast(terrain, layout, factory)
+	MSTTestAssembler.refresh_lod(terrain)
 
 	var build_start := Time.get_ticks_usec()
 	var built := MSTTestNav.build_all_regions(terrain)
@@ -406,9 +415,13 @@ func _phase_navigation(suite: String, dimensions: Vector3i, factory: MSTTestModu
 func _phase_threading(suite: String, dimensions: Vector3i, factory: MSTTestModules) -> void:
 	var layout := MSTTestAssembler.build_layout(Vector2i(2, 2))
 	var terrain : MarchingSquaresTerrain = await MSTTestAssembler.make_terrain(
-		dimensions, CELL_SIZE, self, "Threaded_%s" % suite)
+		dimensions, CELL_SIZE, self, "Threaded_%s" % suite, enable_terrain_lod)
 	terrain.position = Vector3(0.0, 0.0, float(dimensions.z - 1) * CELL_SIZE.y * 4.0)
 	MSTTestAssembler.assemble_fast(terrain, layout, factory)
+
+	# attach_fast() skips add_chunk(), and add_chunk() is the only runtime path
+	# that builds LOD proxies, so they have to be asked for explicitly.
+	var lod_proxies_built := MSTTestAssembler.refresh_lod(terrain)
 
 	var chunks : Array = terrain.chunks.values()
 	var probe : MarchingSquaresTerrainChunk = terrain.chunks[Vector2i(0, 0)]
@@ -478,6 +491,23 @@ func _phase_threading(suite: String, dimensions: Vector3i, factory: MSTTestModul
 			sync_reference["total_msec"], job.worker_msec
 		]
 	)
+	# A dug chunk that loses its LOD proxy renders nothing past
+	# terrain_lod_start_distance, because _configure_proxy_visibility() caps its
+	# real tiles at exactly that distance. So "the proxy survived a dig" is a
+	# claim about whether a hole appears in the far view, not about tidiness.
+	if enable_terrain_lod:
+		var lod_proxies_after := MSTTestThreadedDig.count_lod_proxies(terrain)
+		_report.add_timing(suite, "6-threaded", "rebuild LOD proxies after the dig", maxf(job.lod_msec, 0.0),
+			"included in publish" if job.lod_msec >= 0.0 else "no LOD controller on this addon build")
+		_report.add_claim(
+			"lod-survives-threaded-dig",
+			"[%s] A threaded dig leaves every chunk with a live LOD proxy" % suite,
+			lod_proxies_built > 0 and lod_proxies_after == lod_proxies_built,
+			"%d proxies before the dig, %d after; invalidate_chunk() frees them and only the editor branch of _process() ever rebuilds one" % [
+				lod_proxies_built, lod_proxies_after
+			]
+		)
+
 	_report.add_claim(
 		"collision-gap-threaded",
 		"[%s] A threaded dig keeps collision on every frame the job is in flight" % suite,
@@ -502,9 +532,10 @@ func _phase_nav_scale(suite: String, dimensions: Vector3i, factory: MSTTestModul
 
 	var layout := MSTTestAssembler.build_layout(Vector2i(NAV_SCALE_GRID, NAV_SCALE_GRID))
 	var terrain : MarchingSquaresTerrain = await MSTTestAssembler.make_terrain(
-		dimensions, CELL_SIZE, self, "NavScale_%s" % suite)
+		dimensions, CELL_SIZE, self, "NavScale_%s" % suite, enable_terrain_lod)
 	terrain.position = Vector3(float(dimensions.x - 1) * CELL_SIZE.x * 6.0, 0.0, 0.0)
 	MSTTestAssembler.assemble_fast(terrain, layout, factory)
+	MSTTestAssembler.refresh_lod(terrain)
 
 	var chunks : Array = terrain.chunks.values()
 	var warm_msec := MSTTestThreadedDig.warm_chunks(chunks)
@@ -723,13 +754,16 @@ func _phase_recast_nav(suite: String, dimensions: Vector3i, factory: MSTTestModu
 
 	var layout := MSTTestAssembler.build_layout(Vector2i(RECAST_NAV_GRID, RECAST_NAV_GRID))
 	var terrain : MarchingSquaresTerrain = await MSTTestAssembler.make_terrain(
-		dimensions, CELL_SIZE, self, "Recast_%s" % suite)
+		dimensions, CELL_SIZE, self, "Recast_%s" % suite, enable_terrain_lod)
 	terrain.position = Vector3(
 		float(dimensions.x - 1) * CELL_SIZE.x * 6.0,
 		0.0,
 		float(dimensions.z - 1) * CELL_SIZE.y * 7.0
 	)
 	MSTTestAssembler.assemble_fast(terrain, layout, factory)
+	# With LOD on, real tiles are capped at terrain_lod_start_distance and this is
+	# the only runtime path that builds the proxies that take over past it.
+	MSTTestAssembler.refresh_lod(terrain)
 
 	# Decoration: geometry that exists in the scene but not in the height map.
 	var props := MSTTestProps.scatter(terrain, PROPS_PER_CHUNK, self)
@@ -914,6 +948,12 @@ func _phase_recast_nav(suite: String, dimensions: Vector3i, factory: MSTTestModu
 	var dug := Vector2i(RECAST_NAV_GRID / 2, RECAST_NAV_GRID / 2)
 	var site := Vector2i(dug.x * stride_x + middle.x + rock_offset, dug.y * stride_z + middle.y + rock_offset)
 	MSTTestDig.dig_area(terrain, site, Vector2i(2, 2), MSTTestModules.FLOOR_HEIGHT, true)
+	# dig_area() goes through regenerate_mesh(), which frees this chunk's LOD
+	# proxy and leaves the rebuild to a pending flag nothing acts on at runtime.
+	# Left alone, this terrain - the one kept for the interactive view - would
+	# have one chunk rendering nothing past terrain_lod_start_distance. Kept out
+	# of dig_area() itself so the phase 3 and 4 dig timings stay comparable.
+	MSTTestThreadedDig.rebuild_lod_proxies(terrain)
 
 	# rebuild_collision() frees the body and builds a new shape resource, so the
 	# references cached by prepare() are stale and have to be resolved again.

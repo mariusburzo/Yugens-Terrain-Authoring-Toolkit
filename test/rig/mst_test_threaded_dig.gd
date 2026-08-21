@@ -25,6 +25,9 @@ var publish_msec : float = 0.0
 ## the whole worker cost lands here instead, where it would otherwise be
 ## invisible - publish_msec starts its clock after the join, not before.
 var join_msec : float = 0.0
+## Cost of rebuilding LOD proxies the dig invalidated. -1 when the addon build
+## has no LOD controller at all.
+var lod_msec : float = 0.0
 var frames_in_flight : int = 0
 var frames_without_collision : int = 0
 
@@ -38,6 +41,7 @@ var _built_navmeshes : Dictionary = {}
 # so which chunks own a nav region has to be settled before it starts.
 var _nav_regions : Dictionary = {}
 var _thread : Thread
+var _lod_invalidated : bool = false
 
 
 ## Applies the height writes and starts the worker. Returns the chunks affected.
@@ -168,7 +172,54 @@ func publish() -> void:
 		if nav_mesh != null and is_instance_valid(region):
 			region.navigation_mesh = nav_mesh
 
+		# regenerate_mesh() is what normally tells the LOD controller a chunk
+		# changed, and this deliberately does not call it, so the distant proxy
+		# would keep rendering pre-dig terrain.
+		#
+		# Invalidating alone is not enough at runtime, and is worse than doing
+		# nothing: invalidate_chunk() frees the proxy and only raises a pending
+		# flag, and the sole thing that acts on that flag sits inside
+		# MarchingSquaresTerrain._process()'s `if is_editor()` branch. Freeing
+		# without rebuilding leaves the chunk rendering nothing at all past
+		# terrain_lod_start_distance, because _configure_proxy_visibility() gives
+		# its real tiles a visibility_range_end of exactly that distance. So the
+		# rebuild is driven explicitly below.
+		if _terrain != null and _terrain.has_method("_invalidate_terrain_lod_chunk"):
+			_terrain._invalidate_terrain_lod_chunk(chunk.chunk_coords)
+			_lod_invalidated = true
+
+	# One apply() for the whole batch: it walks the chunks and builds only the
+	# proxies that are missing, so this rebuilds exactly the ones just freed.
+	if _lod_invalidated:
+		lod_msec = rebuild_lod_proxies(_terrain)
+
 	publish_msec = (Time.get_ticks_usec() - start_usec) / 1000.0
+
+
+## Rebuilds any LOD proxy the terrain is missing, and reports what it cost.
+##
+## Nothing does this at runtime on its own - see the note in publish(). Returns
+## -1.0 when the terrain has no LOD controller, so an older addon build is told
+## apart from a build where the work was free.
+static func rebuild_lod_proxies(terrain) -> float:
+	if terrain == null or not ("_lod_controller" in terrain):
+		return -1.0
+	var controller = terrain._lod_controller
+	if controller == null:
+		return -1.0
+	var start_usec := Time.get_ticks_usec()
+	controller.apply()
+	return (Time.get_ticks_usec() - start_usec) / 1000.0
+
+
+## Live TerrainLODProxy nodes across the terrain, which is what a dig can
+## silently take away.
+static func count_lod_proxies(terrain) -> int:
+	var count := 0
+	for chunk: MarchingSquaresTerrainChunk in terrain.chunks.values():
+		if is_instance_valid(chunk) and chunk.get_node_or_null("TerrainLODProxy") != null:
+			count += 1
+	return count
 
 
 ## Replaces the shape on the existing body instead of freeing and rebuilding it.
