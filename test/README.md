@@ -96,6 +96,39 @@ intended — 13106 triangles down to 4518, precisely 9/25 — but the scoped sou
 source**, at ~266 triangles each, because the parser tessellates their `CylinderShape3D` and
 `BoxShape3D` colliders. That is what per-chunk groups and projected obstructions attack.
 
+## A square kilometre, measured
+
+1024 chunks of 32 m, 5625 props, 1024 bridges, 105992 nav polygons, hybrid source mode
+with obstructions, 3 m border, edge connections off.
+
+| | cost |
+| --- | --- |
+| assemble 1024 chunks | **4031 ms** (3.94 ms each) |
+| scatter 6649 props and bridges | 509 ms |
+| build source, 64 batches of 16 | 79 ms |
+| bake 1024 chunks on the pool | 992 ms (0.97 ms each) |
+| publish 1024 regions | 31 ms |
+| static memory | 226 -> 848 MB, **0.6 MB per chunk** |
+| map publishes a change | 62 ms, 4 physics frames |
+| `map_force_update` | 0.00 ms |
+| re-bake one chunk after a dig | **0.66 ms** main thread, 9.4 ms worker |
+
+**The dig loop is flat with map size.** 0.66 ms at 1024 chunks against 0.51 ms at 25 - the
+navmesh side of runtime editing does not care how big the world is, once the O(map) costs
+listed below are removed. Nav is no longer the thing to worry about at this scale.
+
+**Assembly is, though.** 4 s to attach 1024 chunks, and that is with no cell geometry
+warmed - warming would add ~69 ms per chunk, another 70 s single-threaded. Loading a
+handcrafted map from serialised chunk data avoids the module import per chunk, and the
+0.6 MB per chunk of resident memory is the other reason to stream rather than hold a whole
+kilometre live.
+
+**A\* is the wall, and no bake setting moves it.** `path reach along one edge` is **18
+chunks, 576 m of a 1024 m edge**, and turning off edge connections did not change it - that
+fixed map *sync*, this is search *space*. A cross-map query costs 5 ms and still returns a
+partial path. The levers are keeping only a working set of regions enabled
+(`nav_active_radius_chunks`), or pathing hierarchically over a chunk graph first.
+
 **The navigation map's edge-connection margin is what made a big map unusable.** With it on,
 a one-chunk re-bake on a 1024-region map never published within 60 physics frames and took
 tens of seconds by observation; with it off the map publishes promptly and agents re-path
@@ -268,6 +301,13 @@ That failure also exposed a weak claim. `recast-sees-props` bounded prop clearan
 as a correctly carved hole - so it passed, reporting a mean clearance of 82 m. It is now
 bounded above as well.
 
+**The synchronous dig path loses LOD proxies permanently.** `MSTTestDig.dig_area()` goes
+through `regenerate_mesh()`, which frees the chunk's proxy and raises a flag nothing acts
+on outside the editor. The threaded dig rebuilds its own chunks; nothing rebuilds those.
+This was invisible while `rebuild_lod_proxies()` called the full `apply()`, which quietly
+repaired every missing proxy on the map - scoping it to the dug chunks made the damage
+visible. `lod-survives-threaded-dig` now counts either side of the threaded dig alone.
+
 **Terrain LOD never touches collision, but it does not maintain itself at runtime.**
 `MSTTerrainLodController` only adds a `MeshInstance3D` proxy per chunk and drives
 `visibility_range_begin/end`; there is no `StaticBody3D` or shape anywhere in it, so a
@@ -421,8 +461,8 @@ near a chunk border there is the rig proving its point, not a defect.
 | `recast-sees-props` (obstruction mode) | Crates inside the climb band block too | holds |
 | `lod-survives-threaded-dig` | A threaded dig leaves every chunk a live LOD proxy | holds |
 | `recast-walk-under-bridge` | The floor under a bridge deck stays walkable | holds |
-| `large-map-queryable` | A 1024-chunk map answers a corner-to-corner query | **fails** - engine limit, see below |
-| `large-map-dig-loop` | One chunk re-bakes under 5 ms with 1024 regions live | failed at 6.93 ms; four O(map) costs fixed since |
+| `large-map-queryable` | A 1024-chunk map answers a corner-to-corner query | **fails** - A* reaches 576 m of 1024 m |
+| `large-map-dig-loop` | One chunk re-bakes under 5 ms with 1024 regions live | holds, at 0.66 ms |
 | `recast-seams` | Chunked Recast regions meet across every seam unaided | holds |
 | `recast-parallel` | The pool bake beats the same bakes done one at a time | holds |
 | `recast-dig-loop` | Re-baking one chunk leaves under 5 ms on the main thread | holds |

@@ -540,6 +540,12 @@ func _phase_threading(suite: String, dimensions: Vector3i, factory: MSTTestModul
 	# Now the threaded dig itself, against a synchronous one on the same terrain.
 	var sync_reference := MSTTestDig.dig_area(terrain, site + Vector2i(3, 0), Vector2i(2, 2), MSTTestModules.FLOOR_HEIGHT, true)
 
+	# Counted here, not at assembly. The synchronous digs above went through
+	# regenerate_mesh(), which frees a LOD proxy and leaves the rebuild to a flag
+	# nothing acts on at runtime - so some are already gone by this point, and
+	# folding that into the claim would blame the threaded dig for it.
+	var lod_proxies_before := MSTTestThreadedDig.count_lod_proxies(terrain)
+
 	var job := MSTTestThreadedDig.new()
 	job.start(terrain, site + Vector2i(3, 0), Vector2i(2, 2), MSTTestModules.WALL_HEIGHT)
 	while job.is_running():
@@ -575,9 +581,10 @@ func _phase_threading(suite: String, dimensions: Vector3i, factory: MSTTestModul
 		_report.add_claim(
 			"lod-survives-threaded-dig",
 			"[%s] A threaded dig leaves every chunk with a live LOD proxy" % suite,
-			lod_proxies_built > 0 and lod_proxies_after == lod_proxies_built,
-			"%d proxies before the dig, %d after; invalidate_chunk() frees them and only the editor branch of _process() ever rebuilds one" % [
-				lod_proxies_built, lod_proxies_after
+			lod_proxies_before > 0 and lod_proxies_after == lod_proxies_before,
+			"%d proxies before the threaded dig, %d after; %d were built at assembly, so %d had already been lost to the synchronous digs above - regenerate_mesh() frees a proxy and nothing at runtime rebuilds it" % [
+				lod_proxies_before, lod_proxies_after, lod_proxies_built,
+				lod_proxies_built - lod_proxies_before
 			]
 		)
 
