@@ -4,3 +4,6 @@
 
 [node name="MSTTestRig" type="Node3D" unique_id=97729233]
 script = ExtResource("1_rig")
+run_large_dimensions = false
+run_assembly = false
+run_seams_and_digging = false

@@ -19,18 +19,47 @@ const DIG_REPEATS : int = 5
 const MAX_NAV_SYNC_FRAMES : int = 60
 const NAV_SETTLE_FRAMES : int = 20
 const NAV_SCALE_GRID : int = 5
+const RECAST_NAV_GRID : int = 5
+## Props per chunk in the Recast phase. Enough that a missed one is obvious in
+## the clearance figures, few enough that no corridor is ever plugged.
+const PROPS_PER_CHUNK : int = 6
 ## Pan speed as a fraction of the orbit distance, so it scales with zoom.
 const CAMERA_PAN_SPEED : float = 0.9
 const CAMERA_PAN_BOOST : float = 3.0
 const AGENT_SPEED : float = 14.0
 
+## The suite runs once per dimension setting. Turning one off halves everything
+## below it, and is the single biggest lever on how long a run takes.
 @export var run_large_dimensions : bool = true
 @export var run_small_dimensions : bool = true
 ## Leaves the last assembled terrain in the scene with a camera so seams can be
 ## inspected by eye, and left-click digs a hole.
 @export var interactive_after_run : bool = true
-## Phase 7 assembles and warms a full 5x5 cave, which is the slowest phase by far.
+
+## Phases, in the order they run. Every one builds its own terrain from scratch,
+## so switching off the ones you are not reading is a straight saving - the only
+## shared cost is authoring the modules, which every phase needs.
+##
+## To iterate on navmesh work, leave `run_recast_nav` on and the rest off.
+@export_group("Phases")
+## Phase 1: naive vs direct assembly at 9 and 25 chunks. Four terrains, and the
+## naive 5x5 is deliberately the slowest single measurement in the rig - proving
+## add_chunk() is quadratic means paying the quadratic.
+@export var run_assembly : bool = true
+## Phases 2-4: seam checks, digging, and the border-dig case. Produces the
+## terrain the interactive camera falls back to.
+@export var run_seams_and_digging : bool = true
+## Phase 5: two chunk regions, seam connection, block and reopen a corridor.
+@export var run_navigation : bool = true
+## Phase 6: worker-thread warm-up, threaded dig, collision continuity.
+@export var run_threading : bool = true
+## Phases 7-8: assembles and warms a full 5x5 cave, per-triangle then merged.
 @export var run_nav_scale : bool = true
+## Phase 9: bakes the same cave with Recast instead of the height-map merger,
+## with props scattered on the floor. The only phase that answers "does the
+## navmesh see decoration?".
+@export var run_recast_nav : bool = true
+@export_group("")
 
 var _report : MSTTestReport
 var _live_terrain : MarchingSquaresTerrain
@@ -41,8 +70,12 @@ var _camera_pitch : float = -0.9
 var _camera_target : Vector3 = Vector3.ZERO
 var _camera_distance : float = 120.0
 var _dig_count : int = 0
+var _dig_in_flight : bool = false
 var _agent_body : Node3D
 var _agent : NavigationAgent3D
+var _live_props : Node3D
+var _recast_baker : MSTTestRecastNav
+var _recast_terrain : MarchingSquaresTerrain
 
 
 func _ready() -> void:
@@ -50,6 +83,11 @@ func _ready() -> void:
 		return
 	_report = MSTTestReport.new()
 	_setup_environment()
+	# Every builder has to agree with the navigation map about cell size, or its
+	# regions are rasterised onto a grid they were not built for. Read once, up
+	# front, so a project that overrides navigation/3d/default_cell_size is
+	# followed rather than assumed away.
+	MSTTestNav.use_map_cell_size(self)
 	await get_tree().process_frame
 
 	if run_large_dimensions:
@@ -59,12 +97,15 @@ func _ready() -> void:
 
 	_report.print_all()
 
-	if interactive_after_run and is_instance_valid(_live_terrain):
+	if interactive_after_run:
 		_setup_camera()
-	elif is_instance_valid(_live_terrain):
-		_live_terrain.queue_free()
+	else:
+		if is_instance_valid(_live_terrain):
+			_live_terrain.queue_free()
 		if is_instance_valid(_live_nav_terrain):
 			_live_nav_terrain.queue_free()
+		if is_instance_valid(_live_props):
+			_live_props.queue_free()
 
 
 #region suite
@@ -81,18 +122,28 @@ func _run_suite(suite: String, dimensions: Vector3i) -> void:
 	_report.add_timing(suite, "0-author", "build %d modules" % factory.modules_built,
 		(Time.get_ticks_usec() - build_start) / 1000.0, "one-off, editor-time work in a real project")
 
-	await _phase_assembly(suite, dimensions, factory)
-	var terrain : MarchingSquaresTerrain = await _phase_seams_and_digging(suite, dimensions, factory)
-	await _phase_navigation(suite, dimensions, factory)
-	await _phase_threading(suite, dimensions, factory)
+	if run_assembly:
+		await _phase_assembly(suite, dimensions, factory)
+	var terrain : MarchingSquaresTerrain = null
+	if run_seams_and_digging:
+		terrain = await _phase_seams_and_digging(suite, dimensions, factory)
+	if run_navigation:
+		await _phase_navigation(suite, dimensions, factory)
+	if run_threading:
+		await _phase_threading(suite, dimensions, factory)
 	if run_nav_scale:
 		await _phase_nav_scale(suite, dimensions, factory)
+	if run_recast_nav:
+		await _phase_recast_nav(suite, dimensions, factory)
 
 	factory.close()
 
-	if is_instance_valid(_live_terrain) and _live_terrain != terrain:
-		_live_terrain.queue_free()
-	_live_terrain = terrain
+	# Only phase 2-4 produces a terrain worth keeping. With it switched off the
+	# previous suite's terrain must survive rather than be freed against a null.
+	if terrain != null:
+		if is_instance_valid(_live_terrain) and _live_terrain != terrain:
+			_live_terrain.queue_free()
+		_live_terrain = terrain
 
 
 # Claim: pasting baked modules is near-instant because no meshing happens.
@@ -616,6 +667,272 @@ func _phase_nav_scale(suite: String, dimensions: Vector3i, factory: MSTTestModul
 	# so it is the one worth looking at with Debug > Visible Navigation on.
 	_live_nav_terrain = terrain
 
+
+# Claims: a chunked Recast bake sees decoration that the height-map merger cannot
+# see at all; the bakes parallelise over the worker pool; the per-chunk regions
+# still meet across seams; and one chunk can be re-baked after a dig cheaply
+# enough to matter.
+#
+# The merger is not being replaced here. It reads height_map and nothing else,
+# which is why it is fast and why it is blind. This phase measures the other
+# trade.
+func _phase_recast_nav(suite: String, dimensions: Vector3i, factory: MSTTestModules) -> void:
+	# Only one set of regions may be on the navigation map while clearances are
+	# measured, or a query lands on the other terrain's polygons.
+	if is_instance_valid(_live_nav_terrain):
+		_live_nav_terrain.queue_free()
+		_live_nav_terrain = null
+	if is_instance_valid(_live_props):
+		_live_props.queue_free()
+		_live_props = null
+	for _i in range(2):
+		await get_tree().physics_frame
+
+	var layout := MSTTestAssembler.build_layout(Vector2i(RECAST_NAV_GRID, RECAST_NAV_GRID))
+	var terrain : MarchingSquaresTerrain = await MSTTestAssembler.make_terrain(
+		dimensions, CELL_SIZE, self, "Recast_%s" % suite)
+	terrain.position = Vector3(
+		float(dimensions.x - 1) * CELL_SIZE.x * 6.0,
+		0.0,
+		float(dimensions.z - 1) * CELL_SIZE.y * 7.0
+	)
+	MSTTestAssembler.assemble_fast(terrain, layout, factory)
+
+	# Decoration: geometry that exists in the scene but not in the height map.
+	var props := MSTTestProps.scatter(terrain, PROPS_PER_CHUNK, self)
+	var prop_centres := MSTTestProps.centres(props)
+	_live_props = props
+
+	var far := RECAST_NAV_GRID - 1
+	var from := MSTTestNav.chunk_centre(terrain, Vector2i(0, 0)) + terrain.position
+	var to := MSTTestNav.chunk_centre(terrain, Vector2i(far, far)) + terrain.position
+
+	# --- the merger, on the same terrain, for the contrast --------------------
+	# Vertices are snapped to the navigation map's own rasterisation grid rather
+	# than to 0.01, which is what the chunked-navmesh demo does and is strictly
+	# safer: two vertices the map already treats as one can no longer weld apart.
+	var snap := MSTTestNav.use_map_cell_size(terrain)
+	var merged_start := Time.get_ticks_usec()
+	var merged := MSTTestNav.build_all_merged_regions(terrain)
+	var merged_msec := (Time.get_ticks_usec() - merged_start) / 1000.0
+	_report.add_timing(suite, "9-recast", "merger: build %d regions" % merged["regions"], merged_msec,
+		"%d polygons, height map only, vertices snapped to %.3f" % [merged["polygons"], snap])
+	for _i in range(NAV_SETTLE_FRAMES):
+		await get_tree().physics_frame
+	var merged_clearance := MSTTestProps.nav_clearance(terrain, prop_centres)
+	var merged_path := MSTTestNav.try_path(terrain, from, to)
+
+	MSTTestNav.clear_regions(terrain)
+	for _i in range(NAV_SETTLE_FRAMES):
+		await get_tree().physics_frame
+
+	# --- Recast, demo-faithful: grow by a whole chunk, bake in parallel -------
+	var baker := MSTTestRecastNav.new()
+	baker.parse_props(props)
+	var prepared := baker.prepare(terrain)
+	baker.bake()
+	baker.publish()
+
+	_report.add_timing(suite, "9-recast", "parse %d props (main thread)" % prop_centres.size(),
+		baker.parse_msec, "%d triangles, done once because props are static" % baker.prop_triangles)
+	_report.add_timing(suite, "9-recast", "prepare %d chunks (main thread)" % prepared,
+		baker.prepare_msec, "resolve shapes and transforms a worker may not read")
+	_report.add_timing(suite, "9-recast", "assemble source geometry", baker.assemble_msec,
+		"%d triangles from collision proxies, no scene parse" % baker.source_triangles)
+	# Captured now: baker.bake_msec is overwritten by the single-chunk rebuild
+	# further down, and the trimmed-border comparison below needs the full-bake
+	# figure, not that one.
+	var full_bake_msec := baker.bake_msec
+	var full_bake_chunks := baker.chunks_baked
+	var full_bake_polygons := baker.polygons
+	_report.add_timing(suite, "9-recast", "bake %d chunks on the pool" % baker.chunks_baked,
+		baker.bake_msec,
+		"%.1f ms per chunk, grown by a whole chunk" % (baker.bake_msec / maxf(float(baker.chunks_baked), 1.0)))
+	_report.add_timing(suite, "9-recast", "publish %d regions" % baker.regions, baker.publish_msec,
+		"%d polygons total" % baker.polygons)
+	_report.add_timing(suite, "9-recast", "  of which on the main thread", baker.main_thread_msec(),
+		"prepare + assemble + publish; the parse is a one-off")
+
+	# The scene-parsing route the demo uses, purely for the comparison. It is the
+	# only option for geometry the rig does not own, and it cannot leave the main
+	# thread, so its cost is the argument for assembling from cached shapes.
+	var parse_terrain_msec := baker.parse_terrain(terrain)
+	_report.add_timing(suite, "9-recast", "alt: parse terrain from the tree", parse_terrain_msec,
+		"vs %.2f ms to assemble the same faces off-thread" % baker.assemble_msec)
+
+	for _i in range(NAV_SETTLE_FRAMES):
+		await get_tree().physics_frame
+	var recast_clearance := MSTTestProps.nav_clearance(terrain, prop_centres)
+
+	# Judged on the props that are taller than the effective climb. The short ones
+	# staying walkable is Recast doing what agent_max_climb asks of it, so folding
+	# them into this claim would make it fail for the wrong reason.
+	var blocking : Array = []
+	for kind: String in MSTTestProps.KIND_HEIGHTS.keys():
+		if float(MSTTestProps.KIND_HEIGHTS[kind]) > baker.reliable_block_height():
+			blocking.append_array(MSTTestProps.centres_by_kind(props).get(kind, []))
+	var blocking_clearance := MSTTestProps.nav_clearance(terrain, blocking)
+	_report.add_claim(
+		"recast-sees-props",
+		"[%s] A Recast bake carves out decoration too tall to step onto; the height-map merger cannot" % suite,
+		float(merged_clearance["mean"]) < 0.1
+			and not blocking.is_empty()
+			and float(blocking_clearance["min"]) > baker.agent_radius * 0.5,
+		"%d of %d props stand above the %.2f m reliable-block height: merger leaves them %.2f m of clearance on average, Recast leaves min/mean/max %.2f/%.2f/%.2f m (agent radius %.1f)" % [
+			blocking.size(), prop_centres.size(), baker.reliable_block_height(),
+			merged_clearance["mean"],
+			blocking_clearance["min"], blocking_clearance["mean"], blocking_clearance["max"],
+			baker.agent_radius
+		]
+	)
+	_report.add_note("[%s] Across all %d props Recast leaves min/mean/max %.2f/%.2f/%.2f m of clearance; the merger leaves %.2f/%.2f/%.2f m." % [
+		suite, prop_centres.size(),
+		recast_clearance["min"], recast_clearance["mean"], recast_clearance["max"],
+		merged_clearance["min"], merged_clearance["mean"], merged_clearance["max"]
+	])
+
+	# Split by prop kind, because the interesting variable is height. A prop whose
+	# top sits below the baker's effective climb is stepped onto rather than
+	# walked around, and reports no clearance at all - which is Recast working as
+	# specified, not Recast missing the prop.
+	_report.add_note("[%s] Climb test resolves in %d voxel(s) of %.2f m against a nominal %.2f m climb. Whether a height rasterises to %d voxels or %d depends on where the bake box's y origin lands, so the threshold is a band: under %.2f m a prop is always stepped onto, over %.2f m always carved out, and in between it is stable per bake but not worth designing around." % [
+		suite, baker.climb_voxels(), baker.cell_height, baker.agent_max_climb,
+		baker.climb_voxels(), baker.climb_voxels() + 1,
+		baker.effective_max_climb(), baker.reliable_block_height()
+	])
+	for kind: String in MSTTestProps.KIND_HEIGHTS.keys():
+		var of_kind : Array = MSTTestProps.centres_by_kind(props).get(kind, [])
+		if of_kind.is_empty():
+			continue
+		var kind_clearance := MSTTestProps.nav_clearance(terrain, of_kind)
+		var height : float = MSTTestProps.KIND_HEIGHTS[kind]
+		var verdict := "in the ambiguous band"
+		if height > baker.reliable_block_height():
+			verdict = "above the band, should be carved out"
+		elif height <= baker.effective_max_climb():
+			verdict = "below the band, should be stepped onto"
+		_report.add_note("[%s] %d x %s, %.1f m tall (%s): clearance min/mean/max %.2f/%.2f/%.2f m." % [
+			suite, of_kind.size(), kind, height, verdict,
+			kind_clearance["min"], kind_clearance["mean"], kind_clearance["max"]
+		])
+
+	var recast_path : Dictionary = await MSTTestNav.try_path_until(terrain, from, to, get_tree(), MAX_NAV_SYNC_FRAMES)
+	var recast_pairs := MSTTestNav.adjacent_pair_failures(terrain, RECAST_NAV_GRID)
+	_report.add_claim(
+		"recast-seams",
+		"[%s] Chunked Recast regions meet across every seam, with no manual links" % suite,
+		bool(recast_path["reached"]) and int(recast_pairs["failed"]) == 0,
+		"corner-to-corner reached=%s in %d attempt(s), ended %.2f m from target; %d of %d adjacent pairs failed%s" % [
+			recast_path["reached"], recast_path["attempts"], recast_path["end_distance"],
+			recast_pairs["failed"], recast_pairs["tested"],
+			"" if int(recast_pairs["failed"]) == 0 else "; first: " + str(recast_pairs["first"])
+		]
+	)
+	_report.add_note("[%s] For reference the merged navmesh pathed the same corner-to-corner route with %d point(s), ending %.2f m from the target." % [
+		suite, merged_path["points"], merged_path["end_distance"]
+	])
+
+	# --- the same bakes, serially, so the speed-up is a measured number -------
+	var serial := MSTTestRecastNav.new()
+	serial.parallel = false
+	serial.parse_props(props)
+	serial.prepare(terrain)
+	serial.bake()
+	_report.add_timing(suite, "9-recast", "bake %d chunks serially" % serial.chunks_baked,
+		serial.bake_msec, "same work, one thread, never published")
+	_report.add_claim(
+		"recast-parallel",
+		"[%s] Baking chunks on the worker pool is materially faster than one at a time" % suite,
+		full_bake_msec < serial.bake_msec * 0.7,
+		"pool %.1f ms vs serial %.1f ms over %d chunks on %d processor(s), %.2fx" % [
+			full_bake_msec, serial.bake_msec, full_bake_chunks, OS.get_processor_count(),
+			serial.bake_msec / maxf(full_bake_msec, 0.001)
+		]
+	)
+
+	# --- one chunk re-baked after a dig, which is the dig-loop number ---------
+	var rock_offset := MSTTestModules.PASSAGE_HALF_WIDTH + 3
+	var middle := Vector2i(floori(dimensions.x / 2.0), floori(dimensions.z / 2.0))
+	var stride_x := dimensions.x - 1
+	var stride_z := dimensions.z - 1
+	var dug := Vector2i(RECAST_NAV_GRID / 2, RECAST_NAV_GRID / 2)
+	var site := Vector2i(dug.x * stride_x + middle.x + rock_offset, dug.y * stride_z + middle.y + rock_offset)
+	MSTTestDig.dig_area(terrain, site, Vector2i(2, 2), MSTTestModules.FLOOR_HEIGHT, true)
+
+	# rebuild_collision() frees the body and builds a new shape resource, so the
+	# references cached by prepare() are stale and have to be resolved again.
+	# Polled rather than waited on, so the bake really is off the frame and the
+	# main-thread figure below is not quietly including it.
+	var incremental_start := Time.get_ticks_usec()
+	baker.prepare(terrain)
+	baker.begin_bake([dug], baker.neighbourhood(dug))
+	var frames_in_flight := 0
+	while baker.is_baking():
+		frames_in_flight += 1
+		await get_tree().process_frame
+	baker.end_bake()
+	baker.publish()
+	var incremental_msec := (Time.get_ticks_usec() - incremental_start) / 1000.0
+	_report.add_timing(suite, "9-recast", "re-bake 1 chunk of %d after a dig" % baker.chunk_coords().size(),
+		incremental_msec,
+		"prepare %.2f + assemble %.2f + bake %.2f + publish %.2f, %d frame(s) in flight" % [
+			baker.prepare_msec, baker.assemble_msec, baker.bake_msec, baker.publish_msec, frames_in_flight
+		])
+	_report.add_claim(
+		"recast-dig-loop",
+		"[%s] Re-baking one chunk leaves under 5 ms on the main thread" % suite,
+		baker.main_thread_msec() < 5.0,
+		"main thread %.2f ms (prepare %.2f + assemble %.2f + publish %.2f); the worker did %.2f ms of baking" % [
+			baker.main_thread_msec(), baker.prepare_msec, baker.assemble_msec, baker.publish_msec, baker.bake_msec
+		]
+	)
+
+	# --- trimmed border: the demo grows by a whole chunk, which is 9x the work -
+	var trimmed := MSTTestRecastNav.new()
+	trimmed.parse_props(props)
+	trimmed.prepare(terrain)
+	trimmed.border_size = trimmed.recommended_border()
+	trimmed.bake()
+
+	baker.clear_regions()
+	for _i in range(NAV_SETTLE_FRAMES):
+		await get_tree().physics_frame
+	trimmed.publish()
+	_report.add_timing(suite, "9-recast", "bake %d chunks, %.0f m border" % [trimmed.chunks_baked, trimmed.border_size],
+		trimmed.bake_msec, "%d polygons; vs %.1f ms and %d growing by a whole %.0f m chunk" % [
+			trimmed.polygons, full_bake_msec, full_bake_polygons, baker.chunk_span()
+		])
+
+	for _i in range(NAV_SETTLE_FRAMES):
+		await get_tree().physics_frame
+	var trimmed_path : Dictionary = await MSTTestNav.try_path_until(terrain, from, to, get_tree(), MAX_NAV_SYNC_FRAMES)
+	var trimmed_pairs := MSTTestNav.adjacent_pair_failures(terrain, RECAST_NAV_GRID)
+	var trimmed_ok := bool(trimmed_path["reached"]) and int(trimmed_pairs["failed"]) == 0
+	_report.add_claim(
+		"recast-trimmed-border",
+		"[%s] A border of a few agent radii aligns seams as well as growing by a whole chunk" % suite,
+		trimmed_ok,
+		"%.0f m border: %d of %d adjacent pairs failed, corner-to-corner reached=%s; %.1f ms for %d chunks vs %.1f ms growing by a whole chunk" % [
+			trimmed.border_size, trimmed_pairs["failed"], trimmed_pairs["tested"],
+			trimmed_path["reached"], trimmed.bake_msec, trimmed.chunks_baked, full_bake_msec
+		]
+	)
+
+	_report.add_note("[%s] Recast finds the flat tops of the rock walls walkable too, exactly as the merger does. A height map has no ceiling, so there is nothing above them to fail the agent-height test. agent_max_climb keeps the two layers unconnected, but navmesh_permission or a height filter is still what keeps agents off them." % suite)
+
+	# Whichever configuration held its seams stays live, so the walker and the
+	# interactive dig below run on a navmesh that works.
+	if trimmed_ok:
+		_recast_baker = trimmed
+	else:
+		trimmed.clear_regions()
+		for _i in range(2):
+			await get_tree().physics_frame
+		baker.publish()
+		_recast_baker = baker
+	_recast_terrain = terrain
+	_live_nav_terrain = terrain
+
 #endregion
 
 
@@ -640,18 +957,48 @@ func _setup_environment() -> void:
 	add_child(world_environment)
 
 
+## Frames whichever terrain is most worth looking at, measured from the chunks it
+## actually has rather than from an assumed 3x3. Which one that is depends on
+## which phases ran, so with only phase 9 enabled the camera still opens on the
+## cave with the props in it instead of on empty space.
+func _camera_focus() -> MarchingSquaresTerrain:
+	for candidate: MarchingSquaresTerrain in [_recast_terrain, _live_nav_terrain, _live_terrain]:
+		if is_instance_valid(candidate) and not candidate.chunks.is_empty():
+			return candidate
+	return null
+
+
+static func _terrain_extent(terrain: MarchingSquaresTerrain) -> AABB:
+	var stride_x := float(terrain.dimensions.x - 1) * terrain.cell_size.x
+	var stride_z := float(terrain.dimensions.z - 1) * terrain.cell_size.y
+	var lowest := Vector2i(1 << 30, 1 << 30)
+	var highest := Vector2i(-(1 << 30), -(1 << 30))
+	for coords: Vector2i in terrain.chunks.keys():
+		lowest.x = mini(lowest.x, coords.x)
+		lowest.y = mini(lowest.y, coords.y)
+		highest.x = maxi(highest.x, coords.x)
+		highest.y = maxi(highest.y, coords.y)
+	return AABB(
+		terrain.global_position + Vector3(float(lowest.x) * stride_x, 0.0, float(lowest.y) * stride_z),
+		Vector3(float(highest.x - lowest.x + 1) * stride_x, 0.0, float(highest.y - lowest.y + 1) * stride_z)
+	)
+
+
 func _setup_camera() -> void:
-	var stride_x := float(_live_terrain.dimensions.x - 1) * _live_terrain.cell_size.x
-	var stride_z := float(_live_terrain.dimensions.z - 1) * _live_terrain.cell_size.y
-	_camera_target = Vector3(stride_x * 1.5, 0.0, stride_z * 1.5)
-	_camera_distance = maxf(stride_x, stride_z) * 2.2
+	var focus := _camera_focus()
+	if focus == null:
+		print("[rig] Nothing left in the scene to look at - every phase that builds a terrain was skipped.")
+		return
+	var extent := _terrain_extent(focus)
+	_camera_target = extent.get_center()
+	_camera_distance = maxf(extent.size.x, extent.size.z) * 1.5
 	_camera = Camera3D.new()
 	_camera.name = "RigCamera"
 	_camera.far = 4000.0
 	add_child(_camera)
 	_update_camera()
 	_spawn_agent()
-	print("[rig] Interactive mode: right-drag orbit, wheel zoom, WASD pan, Q/E down/up, Shift faster.")
+	print("[rig] Interactive mode on %s: right-drag orbit, wheel zoom, WASD pan, Q/E down/up, Shift faster." % focus.name)
 	print("[rig] Left-click digs. Middle-click sends the red cube there.")
 
 
@@ -731,7 +1078,22 @@ func _raycast_from_screen(screen_position: Vector2) -> Dictionary:
 	return get_world_3d().direct_space_state.intersect_ray(query)
 
 
+## Digs on a worker and reports where every millisecond went.
+##
+## The synchronous MSTTestDig.dig_area() is what phases 3 and 4 measure, and at
+## 30-190 ms it is a visible frame drop - it is a measurement tool, not something
+## to drive interactively. This runs the same work through MSTTestThreadedDig
+## instead, so the mesh rebuild, the collision proxy and the cold-chunk cell
+## build all land on a worker, and follows it with a Recast re-bake that is
+## polled rather than waited on.
+##
+## The print is the diagnostic: every line separates main-thread cost from worker
+## cost, so "which stage is costing me frames" is answered by reading it rather
+## than by guessing.
 func _dig_at_screen_position(screen_position: Vector2) -> void:
+	# A second dig while one is in flight would race the first job's publish.
+	if _dig_in_flight:
+		return
 	var hit := _raycast_from_screen(screen_position)
 	if hit.is_empty():
 		return
@@ -745,29 +1107,63 @@ func _dig_at_screen_position(screen_position: Vector2) -> void:
 	var local : Vector3 = hit["position"] - terrain.global_position
 	var gx := roundi(local.x / terrain.cell_size.x)
 	var gz := roundi(local.z / terrain.cell_size.y)
-	var result := MSTTestDig.dig_area(terrain, Vector2i(gx - 2, gz - 2), Vector2i(5, 5), MSTTestModules.FLOOR_HEIGHT, true)
+	_dig_in_flight = true
 	_dig_count += 1
 
-	# Chunks that carry a nav region get it rebuilt, so Debug > Visible
-	# Navigation shows the hole appear in the navmesh straight away.
-	var nav_msec := 0.0
-	var nav_regions := 0
-	var nav_start := Time.get_ticks_usec()
-	for coords: Vector2i in result["chunks"]:
-		var chunk : MarchingSquaresTerrainChunk = terrain.chunks.get(coords)
-		if chunk == null or chunk.get_node_or_null(MSTTestNav.REGION_NAME) == null:
-			continue
-		MSTTestNav.build_merged_region(terrain, chunk)
-		nav_regions += 1
-	if nav_regions > 0:
-		nav_msec = (Time.get_ticks_usec() - nav_start) / 1000.0
-		if NavigationServer3D.has_method("map_force_update"):
-			NavigationServer3D.map_force_update(terrain.get_world_3d().navigation_map)
+	var job := MSTTestThreadedDig.new()
+	job.start(terrain, Vector2i(gx - 2, gz - 2), Vector2i(5, 5), MSTTestModules.FLOOR_HEIGHT)
+	while job.is_running():
+		await get_tree().process_frame
+	job.publish()
+	var dug : Array = job.affected_coords()
+	var dig_main_msec := job.prologue_msec + job.publish_msec
 
-	print("[rig] dig %d on %s at (%d, %d): %.2f ms total (mesh %.2f, collision %.2f, nav faces %.2f) across %d chunk(s); %d nav region(s) rebuilt in %.2f ms" % [
-		_dig_count, terrain.name, gx, gz, result["total_msec"], result["mesh_msec"], result["collision_msec"],
-		result["nav_msec"], result["chunks_affected"], nav_regions, nav_msec
+	# The navmesh is rebuilt in view, so Debug > Visible Navigation shows the hole
+	# appear straight away. Which builder does it depends on which terrain was
+	# hit: the Recast cave carries props, so only a Recast re-bake is correct
+	# there, and the merged caves have no props for it to miss.
+	var nav_main_msec := 0.0
+	var nav_worker_msec := 0.0
+	var nav_regions := 0
+	if _recast_baker != null and terrain == _recast_terrain:
+		# The bake box of a dug chunk reaches into its neighbours, so their
+		# geometry has to be in the source even though they are not re-baked.
+		var source_coords : Dictionary = {}
+		for coords: Vector2i in dug:
+			for neighbour: Vector2i in _recast_baker.neighbourhood(coords):
+				source_coords[neighbour] = true
+		# swap_collision_shape() put a new shape resource on each dug chunk, so
+		# the references cached by the last prepare() are stale.
+		_recast_baker.prepare(terrain)
+		_recast_baker.begin_bake(dug, source_coords.keys())
+		while _recast_baker.is_baking():
+			await get_tree().process_frame
+		_recast_baker.end_bake()
+		_recast_baker.publish()
+		nav_regions = _recast_baker.chunks_baked
+		nav_worker_msec = _recast_baker.bake_msec
+		nav_main_msec = _recast_baker.main_thread_msec()
+	else:
+		var nav_start := Time.get_ticks_usec()
+		for coords: Vector2i in dug:
+			var chunk : MarchingSquaresTerrainChunk = terrain.chunks.get(coords)
+			if chunk == null or chunk.get_node_or_null(MSTTestNav.REGION_NAME) == null:
+				continue
+			MSTTestNav.build_merged_region(terrain, chunk)
+			nav_regions += 1
+		if nav_regions > 0:
+			nav_main_msec = (Time.get_ticks_usec() - nav_start) / 1000.0
+	if nav_regions > 0 and NavigationServer3D.has_method("map_force_update"):
+		NavigationServer3D.map_force_update(terrain.get_world_3d().navigation_map)
+
+	print("[rig] dig %d on %s at (%d, %d), %d chunk(s): MAIN THREAD %.2f ms = terrain %.2f (prologue %.2f + publish %.2f) + nav %.2f" % [
+		_dig_count, terrain.name, gx, gz, dug.size(),
+		dig_main_msec + nav_main_msec, dig_main_msec, job.prologue_msec, job.publish_msec, nav_main_msec
 	])
+	print("[rig]   worker: terrain %.2f ms over %d frame(s), nav %.2f ms across %d region(s)" % [
+		job.worker_msec, job.frames_in_flight, nav_worker_msec, nav_regions
+	])
+	_dig_in_flight = false
 
 
 ## A red cube driven by a NavigationAgent3D, so the merged navmesh can be seen

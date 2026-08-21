@@ -69,6 +69,16 @@ func is_running() -> bool:
 	return _thread != null and _thread.is_alive()
 
 
+## Coordinates of every chunk this dig touched, for a nav builder that works in
+## chunk coordinates rather than node references.
+func affected_coords() -> Array:
+	var coords : Array = []
+	for chunk: MarchingSquaresTerrainChunk in _chunks:
+		if is_instance_valid(chunk):
+			coords.append(chunk.chunk_coords)
+	return coords
+
+
 ## Called once per frame while the job is in flight, to prove the chunk keeps its
 ## collision for the whole duration.
 func sample_collision() -> void:

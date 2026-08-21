@@ -14,6 +14,39 @@ class_name MSTTestNav
 
 const REGION_NAME : String = "ChunkNav"
 const WELD_PRECISION : float = 100.0
+## Vertices are snapped to this before welding, following the chunked-navmesh
+## demo's map_cell_size * 0.1.
+##
+## Welding alone is not enough. The navigation map rasterises region edges on its
+## own grid (NavigationServer3D.map_get_cell_size, 0.25 by default), so two
+## vertices closer together than that are the same vertex as far as edge matching
+## is concerned - but a 0.01 weld would keep them apart and split the mesh into
+## islands. Snapping first makes the weld at least as coarse as the map's own
+## verdict. Set it from the live map with use_map_cell_size().
+static var vertex_snap : float = 0.025
+
+
+## Cell size and height of the map these regions sit on. A NavigationMesh that
+## disagrees with its map is rasterised onto a grid it was not built for, which
+## Godot warns about and which shows up as seams that fail to connect.
+static var map_cell_size : float = 0.25
+static var map_cell_height : float = 0.25
+
+
+static func use_map_cell_size(node: Node3D) -> float:
+	var map := node.get_world_3d().navigation_map
+	map_cell_size = NavigationServer3D.map_get_cell_size(map)
+	map_cell_height = NavigationServer3D.map_get_cell_height(map)
+	vertex_snap = maxf(map_cell_size * 0.1, 0.0001)
+	return vertex_snap
+
+
+## Puts a hand-built mesh on the same grid as the map it is about to join.
+## The defaults happen to match today; this stops that being load-bearing.
+static func _match_map(nav_mesh: NavigationMesh) -> NavigationMesh:
+	nav_mesh.cell_size = map_cell_size
+	nav_mesh.cell_height = map_cell_height
+	return nav_mesh
 ## Cells of clearance carved back from walls, so agents do not hug the rock.
 ## Applied uniformly, including across chunk seams: the erosion pass reads
 ## neighbouring chunks' height data, so both sides of a seam reach the same
@@ -57,14 +90,14 @@ static func build_region(terrain: MarchingSquaresTerrain, chunk: MarchingSquares
 		# A chunk that lost every walkable face must lose its polygons too,
 		# otherwise a rebuilt region silently keeps stale navigation.
 		if existing != null:
-			existing.navigation_mesh = NavigationMesh.new()
+			existing.navigation_mesh = _match_map(NavigationMesh.new())
 		return {"polygons": 0, "vertices": 0, "region": existing}
 
 	# Welding matters: polygons that share an edge by index are connected inside
 	# the region, which keeps the navmesh small and the connectivity unambiguous.
 	var vertices := PackedVector3Array()
 	var lookup : Dictionary = {}
-	var nav_mesh := NavigationMesh.new()
+	var nav_mesh := _match_map(NavigationMesh.new())
 	var polygons : Array[PackedInt32Array] = []
 	for index in range(0, faces.size(), 3):
 		var polygon := PackedInt32Array()
@@ -88,7 +121,8 @@ static func build_region(terrain: MarchingSquaresTerrain, chunk: MarchingSquares
 	return {"polygons": polygons.size(), "vertices": vertices.size(), "region": region}
 
 
-static func _weld(lookup: Dictionary, vertices: PackedVector3Array, vertex: Vector3) -> int:
+static func _weld(lookup: Dictionary, vertices: PackedVector3Array, raw_vertex: Vector3) -> int:
+	var vertex := raw_vertex.snappedf(vertex_snap)
 	var key := "%d,%d,%d" % [
 		roundi(vertex.x * WELD_PRECISION),
 		roundi(vertex.y * WELD_PRECISION),
@@ -259,7 +293,7 @@ static func build_merged_navmesh(
 	var cells_x := dims.x - 1
 	var cells_z := dims.z - 1
 	if cells_x <= 0 or cells_z <= 0:
-		return {"navmesh": NavigationMesh.new(), "polygons": 0}
+		return {"navmesh": _match_map(NavigationMesh.new()), "polygons": 0}
 
 	# Height of each flat cell, or NAN where the cell is not flat.
 	var flat : Array = []
@@ -317,7 +351,7 @@ static func build_merged_navmesh(
 
 			polygons.append(_rectangle_perimeter(lookup, vertices, x, x_end, z, z_end, height, cell_size))
 
-	var nav_mesh := NavigationMesh.new()
+	var nav_mesh := _match_map(NavigationMesh.new())
 	nav_mesh.set_vertices(vertices)
 	for polygon in polygons:
 		nav_mesh.add_polygon(polygon)
@@ -476,6 +510,21 @@ static func build_merged_region(terrain: MarchingSquaresTerrain, chunk: Marching
 		region.use_edge_connections = true
 	region.navigation_mesh = result["navmesh"]
 	return int(result["polygons"])
+
+
+## Removes every region this builder created, so a different builder can be
+## measured on the same terrain without both sets of polygons sitting on the map
+## at once.
+static func clear_regions(terrain: MarchingSquaresTerrain) -> int:
+	var removed := 0
+	for chunk: MarchingSquaresTerrainChunk in terrain.chunks.values():
+		if not is_instance_valid(chunk):
+			continue
+		var region := chunk.get_node_or_null(REGION_NAME)
+		if region != null:
+			region.free()
+			removed += 1
+	return removed
 
 
 static func build_all_merged_regions(terrain: MarchingSquaresTerrain) -> Dictionary:
