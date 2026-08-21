@@ -311,6 +311,7 @@ near a chunk border there is the rig proving its point, not a defect.
 | `recast-chunk-groups-scope` | Per-chunk groups scope a parse, props included | holds |
 | `recast-sees-props` (obstruction mode) | Crates inside the climb band block too | holds |
 | `lod-survives-threaded-dig` | A threaded dig leaves every chunk a live LOD proxy | holds |
+| `recast-walk-under-bridge` | The floor under a bridge deck stays walkable | not yet measured |
 | `recast-seams` | Chunked Recast regions meet across every seam unaided | holds |
 | `recast-parallel` | The pool bake beats the same bakes done one at a time | holds |
 | `recast-dig-loop` | Re-baking one chunk leaves under 5 ms on the main thread | holds |
@@ -346,6 +347,7 @@ the `nav-merged-*` results; they are kept as the A/B that identifies the cause.
 | `rig/mst_test_recast_nav.gd` | Chunked Recast baking on the worker pool |
 | `rig/mst_recast_bake_settings.tres` | The `NavigationMesh` template phase 9 bakes from |
 | `rig/mst_test_props.gd` | Placeholder decoration, and the prop-clearance probe |
+| `rig/mst_test_statics.gd` | Bridges: irregular geometry with walk-under clearance |
 | `rig/mst_test_report.gd` | Collects and prints the results table |
 | `tools/export_chunk_as_module.gd` | Editor script: export sculpted chunks as modules |
 

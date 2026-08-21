@@ -126,7 +126,19 @@ var match_map_cells : bool = true
 ## CACHED_SHAPES it scopes the *props* too, which is where most of the triangles
 ## are. The cost is bookkeeping: a prop joins its chunk's group when it spawns,
 ## and has to move groups if it ever crosses a chunk boundary.
-enum SourceMode { CACHED_SHAPES, PARSED_GROUP, PARSED_CHUNK_GROUPS }
+## HYBRID runs all three mechanisms in their own lane instead of forcing every
+## category of geometry through one of them:
+##
+##   terrain           -> cached collision proxies, worker-safe, scoped
+##   irregular statics -> one parse per chunk group, scoped, main thread
+##   decoration        -> projected obstructions, four vertices each
+##
+## Nothing is chosen per chunk. A chunk's source is the union of its three lanes,
+## and a chunk whose static group is empty simply has no parse to make - which on
+## a map where most chunks carry no buildings is where the saving comes from.
+##
+## The classification is per object type and set once, by collision layer.
+enum SourceMode { CACHED_SHAPES, PARSED_GROUP, PARSED_CHUNK_GROUPS, HYBRID }
 var source_mode : SourceMode = SourceMode.CACHED_SHAPES
 ## Group PARSED_GROUP collects from, and the prefix chunk group names are built
 ## from. Applied with register_group() / register_chunk_groups().
@@ -260,6 +272,8 @@ var polygons : int = 0
 var regions : int = 0
 var chunks_baked : int = 0
 var source_triangles : int = 0
+## Chunks the hybrid actually had to parse. The rest had empty static groups.
+var statics_parsed : int = 0
 var prop_triangles : int = 0
 
 #endregion
@@ -276,6 +290,7 @@ var _bake_start_usec : int = 0
 var _map_cell_size : float = 0.25
 var _map_cell_height : float = 0.25
 var _settings : NavigationMesh
+var _parsed_roots : Array = []
 
 
 ## Moves the navigation map onto this baker's cell size instead of the other way
@@ -334,10 +349,23 @@ func reliable_block_height() -> float:
 ## Kept separate from the terrain because props are static: this cost is paid at
 ## load, and every rebuild after a dig merges the result instead of re-parsing.
 func parse_props(root: Node) -> int:
+	return parse_sources([root])
+
+
+## Parses several roots into one snapshot. parse_source_geometry_data() clears
+## its target, so each root goes into a throwaway and is merged in.
+##
+## The roots are remembered, so props_changed() can redo exactly this set.
+func parse_sources(roots: Array) -> int:
 	var start_usec := Time.get_ticks_usec()
+	_parsed_roots = roots.duplicate()
 	_prop_source = NavigationMeshSourceGeometryData3D.new()
-	if root != null:
-		NavigationServer3D.parse_source_geometry_data(_parse_settings(), _prop_source, root)
+	for root: Node in roots:
+		if root == null or not is_instance_valid(root):
+			continue
+		var partial := NavigationMeshSourceGeometryData3D.new()
+		NavigationServer3D.parse_source_geometry_data(_parse_settings(), partial, root)
+		_prop_source.merge(partial)
 	parse_msec = (Time.get_ticks_usec() - start_usec) / 1000.0
 	prop_triangles = floori(_prop_source.get_indices().size() / 3.0)
 	return prop_triangles
@@ -351,10 +379,12 @@ func parse_props(root: Node) -> int:
 ## props fresh on every build and have nothing to do here.
 ##
 ## Returns the re-parse cost in milliseconds, or -1.0 when no work was needed.
-func props_changed(root: Node) -> float:
+func props_changed() -> float:
 	if source_mode != SourceMode.CACHED_SHAPES:
 		return -1.0
-	parse_props(root)
+	if _parsed_roots.is_empty():
+		return -1.0
+	parse_sources(_parsed_roots)
 	return parse_msec
 
 
@@ -446,6 +476,8 @@ func build_source(coords_list: Array = []) -> NavigationMeshSourceGeometryData3D
 		return parse_group_source()
 	if source_mode == SourceMode.PARSED_CHUNK_GROUPS:
 		return parse_chunk_group_source(coords_list)
+	if source_mode == SourceMode.HYBRID:
+		return build_hybrid_source(coords_list)
 
 	var source := NavigationMeshSourceGeometryData3D.new()
 	if _prop_source != null:
@@ -495,6 +527,69 @@ func _masked_settings() -> NavigationMesh:
 	if exclude_collision_mask != 0:
 		parse_settings.geometry_collision_mask = parse_settings.geometry_collision_mask & ~exclude_collision_mask
 	return parse_settings
+
+
+## Group name for the irregular statics standing over one chunk.
+##
+## Kept apart from chunk_group_name() because the hybrid takes terrain from the
+## cached proxies - parsing a group that also held the chunk would collect that
+## terrain a second time.
+func static_group_name(coords: Vector2i) -> String:
+	return "%s_static_%d_%d" % [group_name, coords.x, coords.y]
+
+
+## Puts each node under these roots in the static group for the chunk it stands
+## over. Call after prepare().
+func register_statics(roots: Array) -> int:
+	if _terrain == null:
+		return 0
+	var registered := 0
+	for root: Node in roots:
+		if root == null or not is_instance_valid(root):
+			continue
+		for node in root.get_children():
+			if not (node is Node3D):
+				continue
+			var group := static_group_name(chunk_coords_for((node as Node3D).global_position))
+			if not node.is_in_group(group):
+				node.add_to_group(group)
+			registered += 1
+	return registered
+
+
+## Terrain from cached proxies, statics parsed per chunk, decoration carved.
+##
+## Every lane is scoped to the same chunk list. The statics lane skips chunks
+## with an empty group outright: no parse call, no allocation, nothing.
+func build_hybrid_source(coords_list: Array = []) -> NavigationMeshSourceGeometryData3D:
+	var source := NavigationMeshSourceGeometryData3D.new()
+	var wanted : Array = coords_list if not coords_list.is_empty() else _chunk_geometry.keys()
+
+	for coords: Vector2i in wanted:
+		var entry : Dictionary = _chunk_geometry.get(coords, {})
+		if entry.is_empty():
+			continue
+		var shape : ConcavePolygonShape3D = entry["shape"]
+		source.add_faces(shape.get_faces(), entry["xform"])
+
+	statics_parsed = 0
+	if _terrain != null and _terrain.is_inside_tree():
+		var tree := _terrain.get_tree()
+		var root : Node = parse_root if parse_root != null and is_instance_valid(parse_root) else _terrain
+		var parse_settings := _masked_settings()
+		parse_settings.geometry_source_geometry_mode = NavigationMesh.SOURCE_GEOMETRY_GROUPS_WITH_CHILDREN
+		for coords: Vector2i in wanted:
+			var group := static_group_name(coords)
+			if tree.get_nodes_in_group(group).is_empty():
+				continue
+			parse_settings.geometry_source_group_name = group
+			var partial := NavigationMeshSourceGeometryData3D.new()
+			NavigationServer3D.parse_source_geometry_data(parse_settings, partial, root)
+			source.merge(partial)
+			statics_parsed += 1
+
+	_add_obstructions(source, wanted)
+	return source
 
 
 ## Group name for one chunk's own geometry and the props standing on it.

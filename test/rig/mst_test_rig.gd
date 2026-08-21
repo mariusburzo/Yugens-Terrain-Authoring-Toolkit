@@ -59,7 +59,7 @@ const AGENT_SPEED : float = 14.0
 ## snapshot that goes stale when one is destroyed. "Parsed group" parses
 ## everything in one group with SOURCE_GEOMETRY_GROUPS_WITH_CHILDREN - always
 ## current and authoring-driven, but main-thread-only and unscoped.
-@export_enum("Cached shapes", "Parsed group", "Parsed chunk groups") var recast_source_mode : int = 0
+@export_enum("Cached shapes", "Parsed group", "Parsed chunk groups", "Hybrid") var recast_source_mode : int = 0
 ## Supplies props to the bake as projected obstructions instead of as parsed
 ## collision geometry.
 ##
@@ -108,6 +108,7 @@ var _dig_in_flight : bool = false
 var _agent_body : Node3D
 var _agent : NavigationAgent3D
 var _live_props : Node3D
+var _live_statics : Node3D
 var _recast_baker : MSTTestRecastNav
 var _recast_terrain : MarchingSquaresTerrain
 var _recast_obstructions : Array = []
@@ -142,6 +143,8 @@ func _ready() -> void:
 			_live_nav_terrain.queue_free()
 		if is_instance_valid(_live_props):
 			_live_props.queue_free()
+		if is_instance_valid(_live_statics):
+			_live_statics.queue_free()
 
 
 #region suite
@@ -764,6 +767,9 @@ func _phase_recast_nav(suite: String, dimensions: Vector3i, factory: MSTTestModu
 	if is_instance_valid(_live_props):
 		_live_props.queue_free()
 		_live_props = null
+	if is_instance_valid(_live_statics):
+		_live_statics.queue_free()
+		_live_statics = null
 	for _i in range(2):
 		await get_tree().physics_frame
 
@@ -784,10 +790,16 @@ func _phase_recast_nav(suite: String, dimensions: Vector3i, factory: MSTTestModu
 	var props := MSTTestProps.scatter(terrain, PROPS_PER_CHUNK, self)
 	var prop_centres := MSTTestProps.centres(props)
 	_live_props = props
+	# Irregular geometry an obstruction cannot describe: a deck with a gap under
+	# it. This is what the hybrid's parsed lane is for, and it puts two walkable
+	# layers in one column, which nothing before this phase covered.
+	var statics := MSTTestStatics.scatter_bridges(terrain, self)
+	_live_statics = statics
+
 	# Grouping the parents, not the bodies: the addon only adds navmesh_* groups
 	# to chunk collision bodies in its editor-only branch, so at runtime they
 	# carry none - and WITH_CHILDREN recursion means they do not need to.
-	MSTTestRecastNav.new().register_group([terrain, props])
+	MSTTestRecastNav.new().register_group([terrain, props, statics])
 
 	var far := RECAST_NAV_GRID - 1
 	var from := MSTTestNav.chunk_centre(terrain, Vector2i(0, 0)) + terrain.position
@@ -814,12 +826,18 @@ func _phase_recast_nav(suite: String, dimensions: Vector3i, factory: MSTTestModu
 
 	# --- Recast, demo-faithful: grow by a whole chunk, bake in parallel -------
 	var baker := _make_recast_baker()
-	baker.parse_props(props)
+	baker.parse_sources([props, statics])
 	var prepared := baker.prepare(terrain)
 	# Per-chunk groups need the terrain resolved, so this follows prepare().
 	# Registering them always, whatever mode is selected, keeps the source-mode
 	# comparison below honest.
-	var grouped_nodes := baker.register_chunk_groups([props])
+	# Chunk groups carry everything that gets parsed in that mode. The hybrid's
+	# static groups carry only what its parsed lane should collect - the props go
+	# in too when they are not being supplied as obstructions, so every mode ends
+	# up describing the same world.
+	var grouped_nodes := baker.register_chunk_groups([props, statics])
+	var static_roots : Array = [statics] if recast_props_as_obstructions else [statics, props]
+	var statics_grouped := baker.register_statics(static_roots)
 	# Needs the terrain resolved, so it follows prepare(). Bakers made after this
 	# pick the list up through _make_recast_baker().
 	_recast_obstructions = _build_obstructions(baker, props)
@@ -837,7 +855,7 @@ func _phase_recast_nav(suite: String, dimensions: Vector3i, factory: MSTTestModu
 	])
 	_report.add_note("[%s] Source mode %d (%s); props supplied as %s." % [
 		suite, recast_source_mode,
-		["cached shapes", "one parsed group", "parsed chunk groups"][recast_source_mode],
+		["cached shapes", "one parsed group", "parsed chunk groups", "hybrid"][recast_source_mode],
 		"%d projected obstructions, footprints expanded by the %.2f m agent radius, masked out of the parse" % [
 			_recast_obstructions.size(), baker.agent_radius
 		] if recast_props_as_obstructions else "parsed collision geometry"
@@ -942,6 +960,23 @@ func _phase_recast_nav(suite: String, dimensions: Vector3i, factory: MSTTestModu
 			kind_clearance["min"], kind_clearance["mean"], kind_clearance["max"]
 		])
 
+	# The bridge is the case a projected obstruction cannot express. Parsed as
+	# real geometry the floor under the deck stays walkable; a footprint extruded
+	# straight up would have carved that floor away and sealed the corridor.
+	var under_deck : Array = MSTTestStatics.under_deck_points(statics)
+	if not under_deck.is_empty():
+		var under := MSTTestProps.nav_clearance(terrain, under_deck)
+		_report.add_claim(
+			"recast-walk-under-bridge",
+			"[%s] The floor under a bridge deck stays walkable" % suite,
+			int(under["on_navmesh"]) * 5 >= under_deck.size() * 4,
+			"%d of %d bridge undersides sit on navmesh; clearance min/mean/max %.2f/%.2f/%.2f m, closest point averages y=%.2f with the deck at %.1f m" % [
+				under["on_navmesh"], under_deck.size(),
+				under["min"], under["mean"], under["max"], under["mean_y"],
+				MSTTestStatics.DECK_CLEARANCE
+			]
+		)
+
 	var recast_path : Dictionary = await MSTTestNav.try_path_until(terrain, from, to, get_tree(), MAX_NAV_SYNC_FRAMES)
 	var recast_pairs := MSTTestNav.adjacent_pair_failures(terrain, RECAST_NAV_GRID)
 	_report.add_claim(
@@ -961,7 +996,7 @@ func _phase_recast_nav(suite: String, dimensions: Vector3i, factory: MSTTestModu
 	# --- the same bakes, serially, so the speed-up is a measured number -------
 	var serial := _make_recast_baker()
 	serial.parallel = false
-	serial.parse_props(props)
+	serial.parse_sources([props, statics])
 	serial.prepare(terrain)
 	serial.bake()
 	_report.add_timing(suite, "9-recast", "bake %d chunks serially" % serial.chunks_baked,
@@ -1021,7 +1056,7 @@ func _phase_recast_nav(suite: String, dimensions: Vector3i, factory: MSTTestModu
 
 	# --- trimmed border: the demo grows by a whole chunk, which is 9x the work -
 	var trimmed := _make_recast_baker()
-	trimmed.parse_props(props)
+	trimmed.parse_sources([props, statics])
 	trimmed.prepare(terrain)
 	trimmed.border_size = trimmed.recommended_border()
 	trimmed.bake()
@@ -1059,7 +1094,7 @@ func _phase_recast_nav(suite: String, dimensions: Vector3i, factory: MSTTestModu
 	# pass and measures nothing.
 	var cached := _make_recast_baker()
 	cached.source_mode = MSTTestRecastNav.SourceMode.CACHED_SHAPES
-	cached.parse_props(props)
+	cached.parse_sources([props, statics])
 	cached.prepare(terrain)
 	var grouped := _make_recast_baker()
 	grouped.source_mode = MSTTestRecastNav.SourceMode.PARSED_GROUP
@@ -1067,6 +1102,9 @@ func _phase_recast_nav(suite: String, dimensions: Vector3i, factory: MSTTestModu
 	var chunk_grouped := _make_recast_baker()
 	chunk_grouped.source_mode = MSTTestRecastNav.SourceMode.PARSED_CHUNK_GROUPS
 	chunk_grouped.prepare(terrain)
+	var hybrid := _make_recast_baker()
+	hybrid.source_mode = MSTTestRecastNav.SourceMode.HYBRID
+	hybrid.prepare(terrain)
 
 	var full_start := Time.get_ticks_usec()
 	var cached_full := cached.build_source()
@@ -1094,6 +1132,16 @@ func _phase_recast_nav(suite: String, dimensions: Vector3i, factory: MSTTestModu
 	var chunk_scoped := chunk_grouped.build_source(scope)
 	var chunk_scoped_msec := (Time.get_ticks_usec() - chunk_full_start) / 1000.0
 
+	# Three lanes at once: terrain off the cached proxies, statics parsed per
+	# chunk, decoration carved.
+	var hybrid_start := Time.get_ticks_usec()
+	var hybrid_full := hybrid.build_source()
+	var hybrid_full_msec := (Time.get_ticks_usec() - hybrid_start) / 1000.0
+	var hybrid_full_parses := hybrid.statics_parsed
+	hybrid_start = Time.get_ticks_usec()
+	var hybrid_scoped := hybrid.build_source(scope)
+	var hybrid_scoped_msec := (Time.get_ticks_usec() - hybrid_start) / 1000.0
+
 	var cached_full_tris := floori(cached_full.get_indices().size() / 3.0)
 	var grouped_full_tris := floori(grouped_full.get_indices().size() / 3.0)
 	_report.add_timing(suite, "9-recast", "source: cached shapes, all %d chunks" % cached.chunk_coords().size(),
@@ -1110,6 +1158,15 @@ func _phase_recast_nav(suite: String, dimensions: Vector3i, factory: MSTTestModu
 		])
 	_report.add_timing(suite, "9-recast", "source: chunk groups, %d-chunk scope" % scope.size(),
 		chunk_scoped_msec, "%d triangles; scopes the props too, unlike cached shapes" % floori(chunk_scoped.get_indices().size() / 3.0))
+	_report.add_timing(suite, "9-recast", "source: hybrid, all %d chunks" % cached.chunk_coords().size(),
+		hybrid_full_msec, "%d triangles; %d of %d chunks needed a static parse, %d statics grouped" % [
+			floori(hybrid_full.get_indices().size() / 3.0), hybrid_full_parses,
+			cached.chunk_coords().size(), statics_grouped
+		])
+	_report.add_timing(suite, "9-recast", "source: hybrid, %d-chunk scope" % scope.size(),
+		hybrid_scoped_msec, "%d triangles; %d of %d chunks in scope needed a static parse" % [
+			floori(hybrid_scoped.get_indices().size() / 3.0), hybrid.statics_parsed, scope.size()
+		])
 
 	# Bounds, not just triangle counts. parse_source_geometry_data returns
 	# geometry in the root node's local space, so a root with a transform on it
@@ -1119,16 +1176,20 @@ func _phase_recast_nav(suite: String, dimensions: Vector3i, factory: MSTTestModu
 	var grouped_bounds := grouped_full.get_bounds()
 	var centre_drift := cached_bounds.get_center().distance_to(grouped_bounds.get_center())
 	var chunk_full_tris := floori(chunk_full.get_indices().size() / 3.0)
+	var hybrid_full_tris := floori(hybrid_full.get_indices().size() / 3.0)
 	var chunk_drift := cached_bounds.get_center().distance_to(chunk_full.get_bounds().get_center())
+	var hybrid_drift := cached_bounds.get_center().distance_to(hybrid_full.get_bounds().get_center())
 	_report.add_claim(
 		"recast-source-modes-agree",
-		"[%s] All three source modes collect the same geometry, in the same space" % suite,
+		"[%s] All four source modes collect the same geometry, in the same space" % suite,
 		cached_full_tris == grouped_full_tris and chunk_full_tris == cached_full_tris
-			and centre_drift < 0.1 and chunk_drift < 0.1,
-		"%d cached / %d one group / %d chunk groups triangles; bounds centres %.3f and %.3f m from cached; full build %.2f / %.2f / %.2f ms, %d-chunk scope %.2f / %.2f / %.2f ms" % [
-			cached_full_tris, grouped_full_tris, chunk_full_tris, centre_drift, chunk_drift,
-			cached_full_msec, grouped_full_msec, chunk_full_msec,
-			scope.size(), cached_scoped_msec, grouped_scoped_msec, chunk_scoped_msec
+			and hybrid_full_tris == cached_full_tris
+			and centre_drift < 0.1 and chunk_drift < 0.1 and hybrid_drift < 0.1,
+		"%d cached / %d one group / %d chunk groups / %d hybrid triangles; bounds centres %.3f, %.3f, %.3f m from cached; full build %.2f / %.2f / %.2f / %.2f ms, %d-chunk scope %.2f / %.2f / %.2f / %.2f ms" % [
+			cached_full_tris, grouped_full_tris, chunk_full_tris, hybrid_full_tris,
+			centre_drift, chunk_drift, hybrid_drift,
+			cached_full_msec, grouped_full_msec, chunk_full_msec, hybrid_full_msec,
+			scope.size(), cached_scoped_msec, grouped_scoped_msec, chunk_scoped_msec, hybrid_scoped_msec
 		]
 	)
 	_report.add_claim(
@@ -1523,7 +1584,7 @@ func _destroy_prop(prop: Node3D) -> void:
 		parent.remove_child(prop)
 	prop.queue_free()
 
-	var reparse_msec := _recast_baker.props_changed(_live_props)
+	var reparse_msec := _recast_baker.props_changed()
 	# The obstruction list is a snapshot too, and this prop has just left it.
 	if recast_props_as_obstructions:
 		_recast_obstructions = _build_obstructions(_recast_baker, _live_props)
