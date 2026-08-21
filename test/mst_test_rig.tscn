@@ -7,5 +7,6 @@
 script = ExtResource("1_rig")
 run_large_dimensions = false
 recast_bake_settings = ExtResource("2_bake")
+recast_source_mode = 1
 run_assembly = false
 run_seams_and_digging = false

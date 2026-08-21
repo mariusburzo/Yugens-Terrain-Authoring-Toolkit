@@ -77,11 +77,15 @@ the 1.6 m carts and 5 m trees above the band were carved out cleanly at **1.7-1.
 the usable threshold is not `agent_max_climb` but `effective_max_climb() + cell_height`,
 exposed as `reliable_block_height()`. Leave a `cell_height` of margin, or carve explicitly.
 
-**Assembling source geometry is not faster than parsing it — that was the wrong reason.**
-Building the source from cached collision shapes costs 1.4 / 0.7 ms; parsing the same
-colliders out of the scene tree costs 1.2 / 0.4 ms. Both are noise. The reason to assemble
-stands anyway: parsing walks the scene tree and can only run on the main thread, while
-`get_faces()` and `add_faces()` are resource work a worker can do.
+**Assembling versus parsing: not settled, and an earlier reading here was wrong.** The
+`alt: parse terrain from the tree` row (1.2 / 0.4 ms) was read as beating the assembled
+source (1.4 / 0.7 ms), but those are not the same geometry — that parse covers the terrain
+only, while the assembled source also carries the props. A later run with
+`recast_source_mode` set to parsed group built the *whole* source in 1.8 ms against 0.7 ms
+assembled at 17x17, i.e. the opposite conclusion. The `source:` rows in phase 9 exist to
+settle it properly, four ways, in one run. What does not depend on the outcome: parsing
+walks the scene tree so it is main-thread-only and unscoped, while `get_faces()` and
+`add_faces()` are resource work a worker can do on any subset of chunks.
 
 **Nav regions need ~10-20 physics frames before a query works**, even with
 `NavigationServer3D.map_force_update()`. An early query returns an empty path, which looks
@@ -197,11 +201,26 @@ near a chunk border there is the rig proving its point, not a defect.
 | `nav-merged-queryable` | A merged navmesh paths corner to corner | holds |
 | `nav-merged-every-hop` | Every chunk along the cave edge is reachable | holds |
 | `nav-merged-adjacent-pairs` | Every adjacent pair still connects when merged | holds |
-| `recast-sees-props` | Recast carves out props too tall to step onto; the merger cannot | holds |
+| `recast-sees-props` | Recast carves out props too tall to step onto | failed as first written; see below |
+| `recast-source-modes-agree` | Group parsing collects the same geometry as cached shapes | not yet measured |
 | `recast-seams` | Chunked Recast regions meet across every seam unaided | holds |
 | `recast-parallel` | The pool bake beats the same bakes done one at a time | holds |
 | `recast-dig-loop` | Re-baking one chunk leaves under 5 ms on the main thread | holds |
 | `recast-trimmed-border` | A few-agent-radii border aligns seams as well as a whole chunk | holds |
+
+`recast-sees-props` failed in both runs so far, and neither failure was about Recast. As
+first written it also required the *merger* to report under 0.1 m of clearance at every prop,
+and the merger reports min/mean/max 0.00/2.71/6.00 — a maximum of exactly `WALL_HEIGHT`,
+which does not match any model of where the merged navmesh should be at a prop standing on
+open floor. The claim now judges only the thing it names, and phase 9 reports, per builder,
+how many props stand on navmesh and how high the closest point sat; that is what should
+identify the merger behaviour rather than another guess. The Recast side of it passes on its
+own: props above the band measure 1.67–1.82 m of clearance.
+
+`recast-source-modes-agree` passed vacuously on its first run — both sides of the comparison
+took whichever path `recast_source_mode` selected, so it compared a mode against itself
+(all four source rows reported an identical triangle count, including the scoped one). Both
+bakers now force their mode, so the next run is the first real measurement.
 
 The three `nav-scale-*` failures all measure the per-triangle path and are superseded by
 the `nav-merged-*` results; they are kept as the A/B that identifies the cause.

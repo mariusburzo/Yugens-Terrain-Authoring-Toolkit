@@ -96,6 +96,40 @@ var bake_settings : NavigationMesh
 ## Switching this off lets the template's own cell values stand.
 var match_map_cells : bool = true
 
+## Where the bake's source geometry comes from.
+##
+## CACHED_SHAPES reads each chunk's ConcavePolygonShape3D proxy through
+## get_faces() and merges a props source parsed once at load. Nothing in that
+## touches the scene tree, so it can run on a worker, and it can be scoped to a
+## few chunks - which is what makes an incremental re-bake after a dig cheap.
+## The cost is that the props source is a snapshot: destroy a tree and its hole
+## stays in the navmesh until parse_props() runs again.
+##
+## PARSED_GROUP puts the terrain and the props root in one group and lets
+## NavigationServer3D parse it with SOURCE_GEOMETRY_GROUPS_WITH_CHILDREN, which
+## recurses into every StaticBody3D beneath them. One call, no snapshot to go
+## stale, and adding a node to a group is all it takes to get it into the
+## navmesh. The cost is the mirror image: parsing walks the scene tree so it is
+## main-thread-only, and get_nodes_in_group has no spatial filter, so a
+## single-chunk re-bake re-parses the whole world - cost that scales with the
+## scene rather than with the dig.
+##
+## Grouping the *parent* rather than the bodies matters: the addon only adds
+## navmesh_* groups to chunk collision bodies inside its editor-only branch, so
+## at runtime they carry none. WITH_CHILDREN recursion means they do not need to.
+enum SourceMode { CACHED_SHAPES, PARSED_GROUP }
+var source_mode : SourceMode = SourceMode.CACHED_SHAPES
+## Group PARSED_GROUP collects from. Applied with register_group().
+var group_name : String = "mst_nav_source"
+## Node parse_source_geometry_data() is rooted at.
+##
+## Parsed geometry comes back in the root node's *local* space, so this has to be
+## a node whose global transform is identity or the whole source lands offset
+## from the world-space bake boxes and every chunk bakes empty. The terrain is
+## explicitly not that node - it is positioned. For group mode the root is only
+## used for tree access and that transform, so any identity node in the tree does.
+var parse_root : Node3D
+
 ## Grow and border, in world units. 0 means "one whole chunk", which is what the
 ## demo does. See recommended_border() for the cheaper alternative.
 var border_size : float = 0.0
@@ -170,19 +204,19 @@ func settings() -> NavigationMesh:
 ## filter_walkable_low_height_spans drops walkable surface with less than
 ## agent_height of clearance above it, which is what a ceiling would need.
 static func default_settings() -> NavigationMesh:
-	var settings := NavigationMesh.new()
-	settings.cell_size = 0.25
-	settings.cell_height = 0.25
-	settings.agent_radius = 1.0
-	settings.agent_height = 2.0
-	settings.agent_max_climb = 1.0
-	settings.agent_max_slope = 45.0
-	settings.filter_low_hanging_obstacles = false
-	settings.filter_ledge_spans = false
-	settings.filter_walkable_low_height_spans = false
-	settings.geometry_parsed_geometry_type = NavigationMesh.PARSED_GEOMETRY_STATIC_COLLIDERS
-	settings.geometry_source_geometry_mode = NavigationMesh.SOURCE_GEOMETRY_ROOT_NODE_CHILDREN
-	return settings
+	var def_settings := NavigationMesh.new()
+	def_settings.cell_size = 0.25
+	def_settings.cell_height = 0.25
+	def_settings.agent_radius = 1.0
+	def_settings.agent_height = 2.0
+	def_settings.agent_max_climb = 1.0
+	def_settings.agent_max_slope = 45.0
+	def_settings.filter_low_hanging_obstacles = false
+	def_settings.filter_ledge_spans = false
+	def_settings.filter_walkable_low_height_spans = false
+	def_settings.geometry_parsed_geometry_type = NavigationMesh.PARSED_GEOMETRY_STATIC_COLLIDERS
+	def_settings.geometry_source_geometry_mode = NavigationMesh.SOURCE_GEOMETRY_ROOT_NODE_CHILDREN
+	return def_settings
 
 #endregion
 
@@ -358,6 +392,9 @@ func _parse_settings() -> NavigationMesh:
 ## triangles out of the voxel grid, but they are still copied and still tested,
 ## so a level with thousands of props wants them bucketed by chunk first.
 func build_source(coords_list: Array = []) -> NavigationMeshSourceGeometryData3D:
+	if source_mode == SourceMode.PARSED_GROUP:
+		return parse_group_source()
+
 	var source := NavigationMeshSourceGeometryData3D.new()
 	if _prop_source != null:
 		source.merge(_prop_source)
@@ -368,6 +405,32 @@ func build_source(coords_list: Array = []) -> NavigationMeshSourceGeometryData3D
 			continue
 		var shape : ConcavePolygonShape3D = entry["shape"]
 		source.add_faces(shape.get_faces(), entry["xform"])
+	return source
+
+
+## Adds nodes to the group PARSED_GROUP collects from. Pass the terrain and the
+## props root; everything with a StaticBody3D under them comes along.
+func register_group(nodes: Array) -> void:
+	for node: Node in nodes:
+		if node != null and is_instance_valid(node) and not node.is_in_group(group_name):
+			node.add_to_group(group_name)
+
+
+## One parse of the whole group. Main thread only, and unscoped by design -
+## get_nodes_in_group knows nothing about chunk coordinates, so there is no
+## coords_list equivalent here.
+##
+## The group mode and name are forced onto the copy rather than read from the
+## template, so switching source_mode does not also require editing the resource.
+func parse_group_source() -> NavigationMeshSourceGeometryData3D:
+	var source := NavigationMeshSourceGeometryData3D.new()
+	if _terrain == null or not _terrain.is_inside_tree():
+		return source
+	var parse_settings := settings().duplicate()
+	parse_settings.geometry_source_geometry_mode = NavigationMesh.SOURCE_GEOMETRY_GROUPS_WITH_CHILDREN
+	parse_settings.geometry_source_group_name = group_name
+	var root : Node = parse_root if parse_root != null and is_instance_valid(parse_root) else _terrain
+	NavigationServer3D.parse_source_geometry_data(parse_settings, source, root)
 	return source
 
 

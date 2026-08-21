@@ -98,21 +98,36 @@ static func centres_by_kind(root: Node3D) -> Dictionary:
 ## agent radius means the navmesh was carved around it.
 static func nav_clearance(terrain: MarchingSquaresTerrain, prop_centres: Array) -> Dictionary:
 	if prop_centres.is_empty():
-		return {"count": 0, "min": 0.0, "mean": 0.0, "max": 0.0}
+		return {"count": 0, "min": 0.0, "mean": 0.0, "max": 0.0, "on_navmesh": 0, "mean_y": 0.0, "above_floor": 0}
 	var map := terrain.get_world_3d().navigation_map
 	var total := 0.0
 	var smallest := INF
 	var largest := 0.0
+	# Distance alone cannot tell "the floor here was carved away" from "the floor
+	# here was never in the navmesh and the nearest thing is a rock top". The y
+	# of the point the map actually returned can.
+	var on_navmesh := 0
+	var above_floor := 0
+	var y_total := 0.0
 	for centre: Vector3 in prop_centres:
-		var distance := NavigationServer3D.map_get_closest_point(map, centre).distance_to(centre)
+		var closest := NavigationServer3D.map_get_closest_point(map, centre)
+		var distance := closest.distance_to(centre)
 		total += distance
 		smallest = minf(smallest, distance)
 		largest = maxf(largest, distance)
+		y_total += closest.y
+		if distance < 0.1:
+			on_navmesh += 1
+		if closest.y - centre.y > 1.0:
+			above_floor += 1
 	return {
 		"count": prop_centres.size(),
 		"min": smallest,
 		"mean": total / float(prop_centres.size()),
 		"max": largest,
+		"on_navmesh": on_navmesh,
+		"above_floor": above_floor,
+		"mean_y": y_total / float(prop_centres.size()),
 	}
 
 
