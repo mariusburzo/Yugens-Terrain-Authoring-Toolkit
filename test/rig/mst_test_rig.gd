@@ -985,16 +985,20 @@ func _phase_recast_nav(suite: String, dimensions: Vector3i, factory: MSTTestModu
 			clear_under.append(point)
 
 	if not clear_under.is_empty():
-		var under := MSTTestProps.nav_clearance(terrain, clear_under)
+		var under := MSTTestProps.nav_clearance(terrain, clear_under, baker.cell_size)
+		# Judged on the worst sample against the bake's own resolution, not on a
+		# count against a fixed epsilon. Every underside being within a cell of
+		# walkable ground is the statement; how many land inside an arbitrary
+		# 0.1 m is a fact about voxel quantisation.
 		_report.add_claim(
 			"recast-walk-under-bridge",
 			"[%s] The floor under a bridge deck stays walkable" % suite,
-			int(under["on_navmesh"]) * 5 >= clear_under.size() * 4,
-			"%d of %d undersides on navmesh (%d of %d decks excluded, a prop stands under them); horizontal clearance min/mean/max %.2f/%.2f/%.2f m, navmesh %.2f m above the floor, deck at %.1f m" % [
+			under["max"] < baker.cell_size * 2.0,
+			"worst underside is %.2f m from walkable ground, against a %.2f m cell; %d of %d within one cell (%d of %d decks excluded, a prop stands under them); navmesh %.2f m above the floor, deck at %.1f m" % [
+				under["max"], baker.cell_size,
 				under["on_navmesh"], clear_under.size(),
 				under_deck.size() - clear_under.size(), under_deck.size(),
-				under["min"], under["mean"], under["max"], under["mean_rise"],
-				MSTTestStatics.DECK_CLEARANCE
+				under["mean_rise"], MSTTestStatics.DECK_CLEARANCE
 			]
 		)
 

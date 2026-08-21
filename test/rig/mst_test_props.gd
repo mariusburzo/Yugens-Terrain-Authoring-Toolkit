@@ -173,7 +173,11 @@ static func obstructions(root: Node3D, margin: float = 0.0) -> Array:
 ##
 ## Horizontal near zero means the builder never noticed the prop. At or beyond
 ## the agent radius means the navmesh was carved around it.
-static func nav_clearance(terrain: MarchingSquaresTerrain, prop_centres: Array) -> Dictionary:
+## `on_navmesh_epsilon` is what counts as "standing on it". It has to be at least
+## the bake's cell size: navmesh vertices sit on the voxel grid, so the closest
+## point to a spot that is genuinely walkable can still be most of a cell away.
+## Testing finer than the mesh's own resolution measures quantisation, not cover.
+static func nav_clearance(terrain: MarchingSquaresTerrain, prop_centres: Array, on_navmesh_epsilon: float = 0.1) -> Dictionary:
 	if prop_centres.is_empty():
 		return {"count": 0, "min": 0.0, "mean": 0.0, "max": 0.0, "on_navmesh": 0, "mean_y": 0.0,
 			"above_floor": 0, "mean_rise": 0.0}
@@ -198,7 +202,7 @@ static func nav_clearance(terrain: MarchingSquaresTerrain, prop_centres: Array) 
 		largest = maxf(largest, distance)
 		y_total += closest.y
 		rise_total += closest.y - centre.y
-		if distance < 0.1:
+		if distance < on_navmesh_epsilon:
 			on_navmesh += 1
 		if closest.y - centre.y > 1.0:
 			above_floor += 1
