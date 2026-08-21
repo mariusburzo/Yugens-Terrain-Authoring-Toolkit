@@ -20,6 +20,16 @@ class_name MSTTestProps
 
 
 const GROUP : String = "mst_nav_prop"
+## Props sit on their own collision layer so a game can raycast decoration
+## separately from ground - "what did I click, a wall or a tree?".
+##
+## Bit 3. The terrain's own bodies take collision_layer 17 (bits 1 and 5) plus
+## MarchingSquaresTerrain.extra_collision_layer, which defaults to 9, so bits 1,
+## 5 and 9 are spoken for.
+##
+## Identity still comes from GROUP, not from this: a layer says what a body
+## collides with, a group says what it is.
+const COLLISION_LAYER : int = 1 << 2
 const ROOT_NAME : String = "Props"
 ## Vertices of all-floor margin a prop needs on every side before it is placed,
 ## so no prop ever sits half inside a wall.
@@ -36,6 +46,14 @@ const KIND_HEIGHTS : Dictionary = {
 	"Crate": 1.2,
 	"MineCart": 1.6,
 	"Tree": 5.0,
+}
+## xz extent of each kind, for the projected-obstruction footprint. A projected
+## obstruction is a flat polygon extruded straight up, so this is all the shape
+## information it needs - and all it can represent.
+const KIND_FOOTPRINTS : Dictionary = {
+	"Crate": Vector2(1.2, 1.2),
+	"MineCart": Vector2(1.8, 1.2),
+	"Tree": Vector2(1.2, 1.2),
 }
 
 
@@ -88,6 +106,58 @@ static func centres_by_kind(root: Node3D) -> Dictionary:
 		if not result.has(kind):
 			result[kind] = []
 		result[kind].append((child as Node3D).global_position)
+	return result
+
+
+## Every prop as a projected obstruction: a footprint polygon, a base height and
+## an extrusion, instead of a tessellated collision shape.
+##
+## This is the cheap representation. A parsed BoxShape3D or CylinderShape3D costs
+## ~266 triangles once Godot tessellates it; this costs four vertices and two
+## floats. It also carves regardless of agent_max_climb, which is what the
+## 1.2 m crates need - see MSTTestRecastNav.reliable_block_height().
+##
+## `margin` is not optional in practice: pass the agent radius. Parsed geometry is
+## rasterised into the heightfield *before* Recast erodes it by the agent radius,
+## so a parsed prop ends up with that much clearance around it for free. A
+## projected obstruction is marked into the compact heightfield *after* erosion,
+## so it carves exactly the polygon it is given and nothing more - measured as
+## holes hugging each prop, against 1.67-1.82 m for the same props parsed. The
+## margin puts that back, and matching it to the agent radius reproduces what
+## parsing would have produced.
+##
+## What it cannot represent is anything you walk *under*: the polygon is extruded
+## straight up from its elevation, so an archway or an overhanging branch becomes
+## a solid block. Decoration that exists purely to be walked around is the fit.
+static func obstructions(root: Node3D, margin: float = 0.0) -> Array:
+	var result : Array = []
+	if not is_instance_valid(root):
+		return result
+	for child in root.get_children():
+		if not (child is Node3D):
+			continue
+		var kind := String(child.name).get_slice("_", 0)
+		if not KIND_FOOTPRINTS.has(kind):
+			continue
+		var footprint : Vector2 = KIND_FOOTPRINTS[kind]
+		var centre : Vector3 = (child as Node3D).global_position
+		var half_x := footprint.x * 0.5 + margin
+		var half_z := footprint.y * 0.5 + margin
+		# Wound consistently; only the xz outline is read.
+		var outline := PackedVector3Array([
+			centre + Vector3(-half_x, 0.0, -half_z),
+			centre + Vector3(half_x, 0.0, -half_z),
+			centre + Vector3(half_x, 0.0, half_z),
+			centre + Vector3(-half_x, 0.0, half_z),
+		])
+		result.append({
+			"vertices": outline,
+			"elevation": centre.y,
+			"height": float(KIND_HEIGHTS[kind]),
+			"position": centre,
+			"footprint": footprint,
+			"margin": margin,
+		})
 	return result
 
 
@@ -182,7 +252,7 @@ static func _is_clear_floor(chunk: MarchingSquaresTerrainChunk, x: int, z: int) 
 
 static func _make_prop(index: int) -> StaticBody3D:
 	var body := StaticBody3D.new()
-	body.collision_layer = 1
+	body.collision_layer = COLLISION_LAYER
 	body.add_to_group(GROUP)
 
 	var mesh_instance := MeshInstance3D.new()

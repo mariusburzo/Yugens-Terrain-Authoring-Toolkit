@@ -59,7 +59,16 @@ const AGENT_SPEED : float = 14.0
 ## snapshot that goes stale when one is destroyed. "Parsed group" parses
 ## everything in one group with SOURCE_GEOMETRY_GROUPS_WITH_CHILDREN - always
 ## current and authoring-driven, but main-thread-only and unscoped.
-@export_enum("Cached shapes", "Parsed group") var recast_source_mode : int = 0
+@export_enum("Cached shapes", "Parsed group", "Parsed chunk groups") var recast_source_mode : int = 0
+## Supplies props to the bake as projected obstructions instead of as parsed
+## collision geometry.
+##
+## A footprint polygon plus an elevation and a height, rather than a tessellated
+## BoxShape3D or CylinderShape3D at ~266 triangles each. It also carves
+## regardless of agent_max_climb, so the 1.2 m crates that sit inside the
+## climb-test band should start blocking. Props are masked out of the parsed
+## geometry by collision layer so they are not represented twice.
+@export var recast_props_as_obstructions : bool = false
 
 ## Phases, in the order they run. Every one builds its own terrain from scratch,
 ## so switching off the ones you are not reading is a straight saving - the only
@@ -101,6 +110,7 @@ var _agent : NavigationAgent3D
 var _live_props : Node3D
 var _recast_baker : MSTTestRecastNav
 var _recast_terrain : MarchingSquaresTerrain
+var _recast_obstructions : Array = []
 
 
 func _ready() -> void:
@@ -733,6 +743,11 @@ func _make_recast_baker() -> MSTTestRecastNav:
 	var baker := MSTTestRecastNav.new()
 	baker.bake_settings = recast_bake_settings
 	baker.source_mode = recast_source_mode as MSTTestRecastNav.SourceMode
+	baker.obstructions = _recast_obstructions
+	if recast_props_as_obstructions:
+		# Masked out of every parse, so a prop supplied as an obstruction is not
+		# also collected as a collider.
+		baker.exclude_collision_mask = MSTTestProps.COLLISION_LAYER
 	# Parsed geometry arrives in the root node's local space, and the rig node is
 	# the identity-transform node here. The terrain is not - it is parked away
 	# from the origin so the suites do not overlap.
@@ -801,6 +816,14 @@ func _phase_recast_nav(suite: String, dimensions: Vector3i, factory: MSTTestModu
 	var baker := _make_recast_baker()
 	baker.parse_props(props)
 	var prepared := baker.prepare(terrain)
+	# Per-chunk groups need the terrain resolved, so this follows prepare().
+	# Registering them always, whatever mode is selected, keeps the source-mode
+	# comparison below honest.
+	var grouped_nodes := baker.register_chunk_groups([props])
+	# Needs the terrain resolved, so it follows prepare(). Bakers made after this
+	# pick the list up through _make_recast_baker().
+	_recast_obstructions = _build_obstructions(baker, props)
+	baker.obstructions = _recast_obstructions
 	baker.bake()
 	baker.publish()
 
@@ -811,6 +834,13 @@ func _phase_recast_nav(suite: String, dimensions: Vector3i, factory: MSTTestModu
 		baker.cell_size, baker.cell_height, baker.agent_radius, baker.agent_height,
 		baker.agent_max_climb, baker.agent_max_slope,
 		baker.settings().geometry_parsed_geometry_type, baker.settings().geometry_source_geometry_mode
+	])
+	_report.add_note("[%s] Source mode %d (%s); props supplied as %s." % [
+		suite, recast_source_mode,
+		["cached shapes", "one parsed group", "parsed chunk groups"][recast_source_mode],
+		"%d projected obstructions, footprints expanded by the %.2f m agent radius, masked out of the parse" % [
+			_recast_obstructions.size(), baker.agent_radius
+		] if recast_props_as_obstructions else "parsed collision geometry"
 	])
 	_report.add_timing(suite, "9-recast", "parse %d props (main thread)" % prop_centres.size(),
 		baker.parse_msec, "%d triangles, done once because props are static" % baker.prop_triangles)
@@ -857,7 +887,13 @@ func _phase_recast_nav(suite: String, dimensions: Vector3i, factory: MSTTestModu
 	_report.add_claim(
 		"recast-sees-props",
 		"[%s] A Recast bake carves out decoration too tall to step onto" % suite,
-		not blocking.is_empty() and float(blocking_clearance["min"]) > baker.agent_radius * 0.5,
+		# Bounded above as well as below. "Nothing is walkable near this prop" also
+		# produces a large clearance, so a lower bound alone passes just as
+		# happily for a navmesh that carved the props as for one that failed to
+		# bake at all - which is exactly what a broken source mode looks like.
+		not blocking.is_empty()
+			and float(blocking_clearance["min"]) > baker.agent_radius * 0.5
+			and float(blocking_clearance["mean"]) < baker.agent_radius * 4.0,
 		"%d of %d props stand above the %.2f m reliable-block height: merger leaves them %.2f m of clearance on average, Recast leaves min/mean/max %.2f/%.2f/%.2f m (agent radius %.1f)" % [
 			blocking.size(), prop_centres.size(), baker.reliable_block_height(),
 			merged_clearance["mean"],
@@ -1028,6 +1064,9 @@ func _phase_recast_nav(suite: String, dimensions: Vector3i, factory: MSTTestModu
 	var grouped := _make_recast_baker()
 	grouped.source_mode = MSTTestRecastNav.SourceMode.PARSED_GROUP
 	grouped.prepare(terrain)
+	var chunk_grouped := _make_recast_baker()
+	chunk_grouped.source_mode = MSTTestRecastNav.SourceMode.PARSED_CHUNK_GROUPS
+	chunk_grouped.prepare(terrain)
 
 	var full_start := Time.get_ticks_usec()
 	var cached_full := cached.build_source()
@@ -1046,6 +1085,15 @@ func _phase_recast_nav(suite: String, dimensions: Vector3i, factory: MSTTestModu
 	var grouped_scoped := grouped.build_source(scope)
 	var grouped_scoped_msec := (Time.get_ticks_usec() - scoped_start) / 1000.0
 
+	# The middle option: parsed, so nothing goes stale, but scoped per chunk so
+	# the props come along only for the chunks actually being baked.
+	var chunk_full_start := Time.get_ticks_usec()
+	var chunk_full := chunk_grouped.build_source()
+	var chunk_full_msec := (Time.get_ticks_usec() - chunk_full_start) / 1000.0
+	chunk_full_start = Time.get_ticks_usec()
+	var chunk_scoped := chunk_grouped.build_source(scope)
+	var chunk_scoped_msec := (Time.get_ticks_usec() - chunk_full_start) / 1000.0
+
 	var cached_full_tris := floori(cached_full.get_indices().size() / 3.0)
 	var grouped_full_tris := floori(grouped_full.get_indices().size() / 3.0)
 	_report.add_timing(suite, "9-recast", "source: cached shapes, all %d chunks" % cached.chunk_coords().size(),
@@ -1056,6 +1104,12 @@ func _phase_recast_nav(suite: String, dimensions: Vector3i, factory: MSTTestModu
 		cached_scoped_msec, "%d triangles" % floori(cached_scoped.get_indices().size() / 3.0))
 	_report.add_timing(suite, "9-recast", "source: parsed group, %d-chunk scope" % scope.size(),
 		grouped_scoped_msec, "%d triangles; groups have no spatial filter, so this is the global cost" % floori(grouped_scoped.get_indices().size() / 3.0))
+	_report.add_timing(suite, "9-recast", "source: chunk groups, all %d chunks" % cached.chunk_coords().size(),
+		chunk_full_msec, "%d triangles across %d grouped nodes, one parse per chunk" % [
+			floori(chunk_full.get_indices().size() / 3.0), grouped_nodes
+		])
+	_report.add_timing(suite, "9-recast", "source: chunk groups, %d-chunk scope" % scope.size(),
+		chunk_scoped_msec, "%d triangles; scopes the props too, unlike cached shapes" % floori(chunk_scoped.get_indices().size() / 3.0))
 
 	# Bounds, not just triangle counts. parse_source_geometry_data returns
 	# geometry in the root node's local space, so a root with a transform on it
@@ -1064,13 +1118,33 @@ func _phase_recast_nav(suite: String, dimensions: Vector3i, factory: MSTTestModu
 	var cached_bounds := cached_full.get_bounds()
 	var grouped_bounds := grouped_full.get_bounds()
 	var centre_drift := cached_bounds.get_center().distance_to(grouped_bounds.get_center())
+	var chunk_full_tris := floori(chunk_full.get_indices().size() / 3.0)
+	var chunk_drift := cached_bounds.get_center().distance_to(chunk_full.get_bounds().get_center())
 	_report.add_claim(
 		"recast-source-modes-agree",
-		"[%s] Parsing one group collects the same geometry, in the same space, as assembling from cached shapes" % suite,
-		cached_full_tris == grouped_full_tris and centre_drift < 0.1,
-		"%d vs %d triangles; bounds centres %.3f m apart; %.2f ms cached vs %.2f ms parsed for everything, %.2f vs %.2f for a %d-chunk scope" % [
-			cached_full_tris, grouped_full_tris, centre_drift,
-			cached_full_msec, grouped_full_msec, cached_scoped_msec, grouped_scoped_msec, scope.size()
+		"[%s] All three source modes collect the same geometry, in the same space" % suite,
+		cached_full_tris == grouped_full_tris and chunk_full_tris == cached_full_tris
+			and centre_drift < 0.1 and chunk_drift < 0.1,
+		"%d cached / %d one group / %d chunk groups triangles; bounds centres %.3f and %.3f m from cached; full build %.2f / %.2f / %.2f ms, %d-chunk scope %.2f / %.2f / %.2f ms" % [
+			cached_full_tris, grouped_full_tris, chunk_full_tris, centre_drift, chunk_drift,
+			cached_full_msec, grouped_full_msec, chunk_full_msec,
+			scope.size(), cached_scoped_msec, grouped_scoped_msec, chunk_scoped_msec
+		]
+	)
+	_report.add_claim(
+		"recast-chunk-groups-scope",
+		"[%s] Per-chunk groups scope a parse to the chunks asked for, props included" % suite,
+		# Strictly smaller than the unscoped flat group, and never worse than
+		# cached shapes. Not strictly smaller than cached: that only held while
+		# props were parsed geometry cached shapes had to carry whole. Supply
+		# them as projected obstructions and both modes carry pure terrain and
+		# scope identically, which is the right answer rather than a regression.
+		floori(chunk_scoped.get_indices().size() / 3.0) < floori(grouped_scoped.get_indices().size() / 3.0)
+			and floori(chunk_scoped.get_indices().size() / 3.0) <= floori(cached_scoped.get_indices().size() / 3.0),
+		"%d-chunk scope: %d triangles from chunk groups vs %d from cached shapes (which cannot scope props) and %d from one flat group (which cannot scope at all)" % [
+			scope.size(), floori(chunk_scoped.get_indices().size() / 3.0),
+			floori(cached_scoped.get_indices().size() / 3.0),
+			floori(grouped_scoped.get_indices().size() / 3.0)
 		]
 	)
 
@@ -1155,7 +1229,7 @@ func _setup_camera() -> void:
 	_update_camera()
 	_spawn_agent()
 	print("[rig] Interactive mode on %s: right-drag orbit, wheel zoom, WASD pan, Q/E down/up, Shift faster." % focus.name)
-	print("[rig] Left-click digs. Middle-click sends the red cube there.")
+	print("[rig] Left-click digs, or chops down a prop if you click one. Middle-click sends the red cube there.")
 
 
 func _process(delta: float) -> void:
@@ -1252,6 +1326,14 @@ func _dig_at_screen_position(screen_position: Vector2) -> void:
 		return
 	var hit := _raycast_from_screen(screen_position)
 	if hit.is_empty():
+		return
+
+	# A prop under the cursor is chopped down instead of dug around. Identified
+	# by group rather than by collision layer: the layer is there so a game can
+	# query decoration separately, but the group is what says "this is a prop".
+	var prop := _prop_from_collider(hit["collider"])
+	if prop != null:
+		await _destroy_prop(prop)
 		return
 
 	# Dig whichever terrain was actually hit, not just the live one, so the nav
@@ -1388,6 +1470,86 @@ func _send_agent_to(target: Vector3) -> void:
 	print("[rig] walker target %s: %d path point(s), %.1f m away" % [
 		str(target.round()), path.size(), _agent_body.global_position.distance_to(target)
 	])
+
+
+## Props as projected obstructions, tagged with the chunk each stands over so a
+## scoped source can carry only the ones it needs.
+func _build_obstructions(baker: MSTTestRecastNav, props: Node3D) -> Array:
+	if not recast_props_as_obstructions:
+		return []
+	# Expanded by the agent radius: an obstruction is marked after Recast has
+	# already eroded, so unlike parsed geometry it gets no clearance of its own.
+	var list := MSTTestProps.obstructions(props, baker.agent_radius)
+	for entry: Dictionary in list:
+		entry["coords"] = baker.chunk_coords_for(entry["position"])
+	return list
+
+
+func _prop_from_collider(collider: Variant) -> Node3D:
+	var node := collider as Node
+	while node != null:
+		if node.is_in_group(MSTTestProps.GROUP):
+			return node as Node3D
+		node = node.get_parent()
+	return null
+
+
+## Chops a prop down and rebuilds only what its absence actually changed.
+##
+## Nothing about the terrain moved, so there is no mesh to regenerate, no
+## collision proxy to rebuild, no cell geometry to warm and no LOD proxy to
+## invalidate - and prepare() is skipped too, because the chunk shapes it caches
+## are still valid. Only the navmesh is wrong, and only around this chunk.
+##
+## This is also the case that separates the source modes: CACHED_SHAPES parses
+## props once and merges that snapshot into every build, so it has to be told;
+## the parsed modes collect props fresh and simply stop finding this one.
+func _destroy_prop(prop: Node3D) -> void:
+	if _recast_baker == null or not is_instance_valid(_recast_terrain):
+		prop.queue_free()
+		return
+
+	_dig_in_flight = true
+	_dig_count += 1
+	var prop_name := String(prop.name)
+	var coords := _recast_baker.chunk_coords_for(prop.global_position)
+
+	var start_usec := Time.get_ticks_usec()
+	# Out of the tree now, not at the end of the frame. A parsed source mode
+	# collects through get_nodes_in_group(), and a node still in the tree is
+	# still in that list - queue_free() alone would let it be parsed once more.
+	var parent := prop.get_parent()
+	if parent != null:
+		parent.remove_child(prop)
+	prop.queue_free()
+
+	var reparse_msec := _recast_baker.props_changed(_live_props)
+	# The obstruction list is a snapshot too, and this prop has just left it.
+	if recast_props_as_obstructions:
+		_recast_obstructions = _build_obstructions(_recast_baker, _live_props)
+		_recast_baker.obstructions = _recast_obstructions
+
+	_recast_baker.begin_bake([coords], _recast_baker.neighbourhood(coords))
+	var frames := 0
+	while _recast_baker.is_baking():
+		frames += 1
+		await get_tree().process_frame
+	_recast_baker.end_bake()
+	_recast_baker.publish()
+	var main_msec := _recast_baker.assemble_msec + _recast_baker.publish_msec + maxf(reparse_msec, 0.0)
+
+	if NavigationServer3D.has_method("map_force_update"):
+		NavigationServer3D.map_force_update(_recast_terrain.get_world_3d().navigation_map)
+
+	print("[rig] chop %d: %s on chunk %s, navmesh only: MAIN THREAD %.2f ms = source %.2f + publish %.2f%s" % [
+		_dig_count, prop_name, str(coords), main_msec,
+		_recast_baker.assemble_msec, _recast_baker.publish_msec,
+		"" if reparse_msec < 0.0 else " + props re-parse %.2f (cached-shapes snapshot went stale)" % reparse_msec
+	])
+	print("[rig]   worker: nav %.2f ms over %d frame(s); no mesh, collision, cell or LOD work at all" % [
+		_recast_baker.bake_msec, frames
+	])
+	_dig_in_flight = false
 
 
 func _terrain_from_collider(collider: Variant) -> MarchingSquaresTerrain:

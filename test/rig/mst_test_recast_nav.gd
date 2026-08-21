@@ -117,9 +117,19 @@ var match_map_cells : bool = true
 ## Grouping the *parent* rather than the bodies matters: the addon only adds
 ## navmesh_* groups to chunk collision bodies inside its editor-only branch, so
 ## at runtime they carry none. WITH_CHILDREN recursion means they do not need to.
-enum SourceMode { CACHED_SHAPES, PARSED_GROUP }
+## PARSED_CHUNK_GROUPS is the middle option: one group per chunk, holding that
+## chunk and the props standing on it, parsed with GROUPS_WITH_CHILDREN one group
+## at a time and merged into a single source - parse_source_geometry_data()
+## clears its target rather than appending, so the merge is what accumulates.
+## It keeps PARSED_GROUP's property that nothing can go stale while regaining the
+## spatial scope that makes an incremental re-bake cheap - and unlike
+## CACHED_SHAPES it scopes the *props* too, which is where most of the triangles
+## are. The cost is bookkeeping: a prop joins its chunk's group when it spawns,
+## and has to move groups if it ever crosses a chunk boundary.
+enum SourceMode { CACHED_SHAPES, PARSED_GROUP, PARSED_CHUNK_GROUPS }
 var source_mode : SourceMode = SourceMode.CACHED_SHAPES
-## Group PARSED_GROUP collects from. Applied with register_group().
+## Group PARSED_GROUP collects from, and the prefix chunk group names are built
+## from. Applied with register_group() / register_chunk_groups().
 var group_name : String = "mst_nav_source"
 ## Node parse_source_geometry_data() is rooted at.
 ##
@@ -129,6 +139,25 @@ var group_name : String = "mst_nav_source"
 ## explicitly not that node - it is positioned. For group mode the root is only
 ## used for tree access and that transform, so any identity node in the tree does.
 var parse_root : Node3D
+
+## Props represented as projected obstructions rather than parsed geometry.
+##
+## Each entry is {"vertices": PackedVector3Array, "elevation": float,
+## "height": float, "coords": Vector2i}. add_projected_obstruction() carves the
+## footprint out of the navmesh at bake time, which costs four vertices instead
+## of a tessellated collider and ignores the climb test entirely - so a prop
+## shorter than reliable_block_height() blocks anyway.
+##
+## Whatever is listed here must also be kept out of the parsed geometry, or it
+## is represented twice. exclude_collision_mask is how.
+var obstructions : Array = []
+## Collision layers removed from geometry_collision_mask before any parse.
+##
+## Props sit on their own layer, so masking that layer out is what stops them
+## being collected as colliders while they are being supplied as obstructions
+## instead. Applies to every source mode, including the props parse that
+## CACHED_SHAPES does.
+var exclude_collision_mask : int = 0
 
 ## Grow and border, in world units. 0 means "one whole chunk", which is what the
 ## demo does. See recommended_border() for the cheaper alternative.
@@ -314,6 +343,21 @@ func parse_props(root: Node) -> int:
 	return prop_triangles
 
 
+## Call when a prop has been added or removed.
+##
+## Only CACHED_SHAPES holds a props snapshot that can now be wrong - it parses
+## once and merges that result into every later build, which is exactly what
+## makes it cheap and exactly what makes it go stale. The parsed modes collect
+## props fresh on every build and have nothing to do here.
+##
+## Returns the re-parse cost in milliseconds, or -1.0 when no work was needed.
+func props_changed(root: Node) -> float:
+	if source_mode != SourceMode.CACHED_SHAPES:
+		return -1.0
+	parse_props(root)
+	return parse_msec
+
+
 ## The demo's route: parse the terrain's colliders out of the scene tree as well,
 ## rather than assembling them from the cached proxy shapes. Slower and
 ## main-thread-bound, but it is the honest baseline to measure against, and it is
@@ -378,7 +422,13 @@ static func find_collision_shape(chunk: MarchingSquaresTerrainChunk) -> ConcaveP
 ## PARSED_GEOMETRY_MESH_INSTANCES or to a group source mode and both parse calls
 ## follow. Handed a duplicate so nothing downstream can write to the working copy.
 func _parse_settings() -> NavigationMesh:
-	return settings().duplicate()
+	var parse_settings := _masked_settings()
+	# Forced: both callers hand parse_source_geometry_data an explicit root node
+	# and mean "everything under this". If the template happened to carry a group
+	# mode, they would go looking for a group instead and collect nothing at all -
+	# silently, since an empty source is indistinguishable from empty terrain.
+	parse_settings.geometry_source_geometry_mode = NavigationMesh.SOURCE_GEOMETRY_ROOT_NODE_CHILDREN
+	return parse_settings
 
 #endregion
 
@@ -394,6 +444,8 @@ func _parse_settings() -> NavigationMesh:
 func build_source(coords_list: Array = []) -> NavigationMeshSourceGeometryData3D:
 	if source_mode == SourceMode.PARSED_GROUP:
 		return parse_group_source()
+	if source_mode == SourceMode.PARSED_CHUNK_GROUPS:
+		return parse_chunk_group_source(coords_list)
 
 	var source := NavigationMeshSourceGeometryData3D.new()
 	if _prop_source != null:
@@ -405,7 +457,28 @@ func build_source(coords_list: Array = []) -> NavigationMeshSourceGeometryData3D
 			continue
 		var shape : ConcavePolygonShape3D = entry["shape"]
 		source.add_faces(shape.get_faces(), entry["xform"])
+	_add_obstructions(source, wanted)
 	return source
+
+
+## Adds the obstructions standing over the chunks being sourced.
+##
+## Scoped the same way the geometry is: an obstruction outside the bake box would
+## be filtered out anyway, but carrying it costs a copy for nothing.
+func _add_obstructions(source: NavigationMeshSourceGeometryData3D, coords_list: Array) -> int:
+	if obstructions.is_empty():
+		return 0
+	var wanted : Dictionary = {}
+	for coords: Vector2i in coords_list:
+		wanted[coords] = true
+	var added := 0
+	for obstruction: Dictionary in obstructions:
+		if not wanted.is_empty() and obstruction.has("coords") and not wanted.has(obstruction["coords"]):
+			continue
+		source.add_projected_obstruction(
+			obstruction["vertices"], obstruction["elevation"], obstruction["height"], true)
+		added += 1
+	return added
 
 
 ## Adds nodes to the group PARSED_GROUP collects from. Pass the terrain and the
@@ -414,6 +487,85 @@ func register_group(nodes: Array) -> void:
 	for node: Node in nodes:
 		if node != null and is_instance_valid(node) and not node.is_in_group(group_name):
 			node.add_to_group(group_name)
+
+
+## A copy of the template with the excluded layers taken out of the parse mask.
+func _masked_settings() -> NavigationMesh:
+	var parse_settings := settings().duplicate()
+	if exclude_collision_mask != 0:
+		parse_settings.geometry_collision_mask = parse_settings.geometry_collision_mask & ~exclude_collision_mask
+	return parse_settings
+
+
+## Group name for one chunk's own geometry and the props standing on it.
+func chunk_group_name(coords: Vector2i) -> String:
+	return "%s_%d_%d" % [group_name, coords.x, coords.y]
+
+
+## Which chunk a world position stands over.
+func chunk_coords_for(world_position: Vector3) -> Vector2i:
+	if _terrain == null:
+		return Vector2i.ZERO
+	var stride_x := float(_terrain.dimensions.x - 1) * _terrain.cell_size.x
+	var stride_z := float(_terrain.dimensions.z - 1) * _terrain.cell_size.y
+	var local := world_position - _terrain.global_position
+	return Vector2i(floori(local.x / stride_x), floori(local.z / stride_z))
+
+
+## Puts every chunk, and every prop, in the group for the chunk it stands over.
+## Call after prepare(), which is what resolves the terrain.
+##
+## A prop near a chunk border may overhang its neighbour, but a bake always
+## sources the dug chunk's whole neighbourhood, so an overhanging prop is still
+## collected by any bake that could be affected by it.
+func register_chunk_groups(prop_roots: Array = []) -> int:
+	if _terrain == null:
+		return 0
+	var registered := 0
+	for coords: Vector2i in _terrain.chunks.keys():
+		var chunk = _terrain.chunks[coords]
+		if not is_instance_valid(chunk):
+			continue
+		var chunk_group := chunk_group_name(coords)
+		if not chunk.is_in_group(chunk_group):
+			chunk.add_to_group(chunk_group)
+		registered += 1
+	for root: Node in prop_roots:
+		if root == null or not is_instance_valid(root):
+			continue
+		for prop in root.get_children():
+			if not (prop is Node3D):
+				continue
+			var prop_group := chunk_group_name(chunk_coords_for((prop as Node3D).global_position))
+			if not prop.is_in_group(prop_group):
+				prop.add_to_group(prop_group)
+			registered += 1
+	return registered
+
+
+## One parse per chunk group, merged into a single source. This is the only
+## parsed mode that honours coords_list.
+##
+## parse_source_geometry_data() *clears* the geometry object it is given before
+## filling it - it does not append. Parsing N groups straight into one accumulator
+## therefore leaves only the last group's geometry, which shows up as a navmesh
+## covering one chunk and nothing else. So each group is parsed into a throwaway
+## and merged in, and merge() is the call that actually accumulates.
+func parse_chunk_group_source(coords_list: Array = []) -> NavigationMeshSourceGeometryData3D:
+	var source := NavigationMeshSourceGeometryData3D.new()
+	if _terrain == null or not _terrain.is_inside_tree():
+		return source
+	var root : Node = parse_root if parse_root != null and is_instance_valid(parse_root) else _terrain
+	var parse_settings := _masked_settings()
+	parse_settings.geometry_source_geometry_mode = NavigationMesh.SOURCE_GEOMETRY_GROUPS_WITH_CHILDREN
+	var wanted : Array = coords_list if not coords_list.is_empty() else _chunk_geometry.keys()
+	for coords: Vector2i in wanted:
+		parse_settings.geometry_source_group_name = chunk_group_name(coords)
+		var partial := NavigationMeshSourceGeometryData3D.new()
+		NavigationServer3D.parse_source_geometry_data(parse_settings, partial, root)
+		source.merge(partial)
+	_add_obstructions(source, wanted)
+	return source
 
 
 ## One parse of the whole group. Main thread only, and unscoped by design -
@@ -426,11 +578,12 @@ func parse_group_source() -> NavigationMeshSourceGeometryData3D:
 	var source := NavigationMeshSourceGeometryData3D.new()
 	if _terrain == null or not _terrain.is_inside_tree():
 		return source
-	var parse_settings := settings().duplicate()
+	var parse_settings := _masked_settings()
 	parse_settings.geometry_source_geometry_mode = NavigationMesh.SOURCE_GEOMETRY_GROUPS_WITH_CHILDREN
 	parse_settings.geometry_source_group_name = group_name
 	var root : Node = parse_root if parse_root != null and is_instance_valid(parse_root) else _terrain
 	NavigationServer3D.parse_source_geometry_data(parse_settings, source, root)
+	_add_obstructions(source, [])
 	return source
 
 

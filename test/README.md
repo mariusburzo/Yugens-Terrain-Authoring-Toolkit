@@ -77,15 +77,112 @@ the 1.6 m carts and 5 m trees above the band were carved out cleanly at **1.7-1.
 the usable threshold is not `agent_max_climb` but `effective_max_climb() + cell_height`,
 exposed as `reliable_block_height()`. Leave a `cell_height` of margin, or carve explicitly.
 
-**Assembling versus parsing: not settled, and an earlier reading here was wrong.** The
-`alt: parse terrain from the tree` row (1.2 / 0.4 ms) was read as beating the assembled
-source (1.4 / 0.7 ms), but those are not the same geometry — that parse covers the terrain
-only, while the assembled source also carries the props. A later run with
-`recast_source_mode` set to parsed group built the *whole* source in 1.8 ms against 0.7 ms
-assembled at 17x17, i.e. the opposite conclusion. The `source:` rows in phase 9 exist to
-settle it properly, four ways, in one run. What does not depend on the outcome: parsing
-walks the scene tree so it is main-thread-only and unscoped, while `get_faces()` and
-`add_faces()` are resource work a worker can do on any subset of chunks.
+**Assembling beats parsing, and props dominate either way.** Settled at 17x17 with the two
+modes measured side by side in one run, collecting provably identical geometry (same
+triangle count, bounds centres 0.000 m apart):
+
+| | full 25 chunks | 9-chunk scope |
+| --- | --- | --- |
+| cached shapes | 0.55 ms, 42398 tri | **0.39 ms, 33810 tri** |
+| one flat group | 1.87 ms, 42398 tri | 1.74 ms, 42398 tri |
+
+Cached is 3.4x faster for a full build and 4.5x faster scoped. An earlier note here claimed
+the opposite; it compared `alt: parse terrain from the tree` (terrain only) against an
+assembled source that also carried the props, which is not the same geometry.
+
+The more useful number is the scoped triangle count. Terrain scoping works exactly as
+intended — 13106 triangles down to 4518, precisely 9/25 — but the scoped source still carries
+33810, because all 110 props are merged in whole regardless. **Props are 87% of a scoped
+source**, at ~266 triangles each, because the parser tessellates their `CylinderShape3D` and
+`BoxShape3D` colliders. That is what per-chunk groups and projected obstructions attack.
+
+**Projected obstructions make props free, and change which source mode to pick.** Supplying
+each prop as a footprint polygon plus an elevation and a height, with the props' collision
+layer masked out of the parse, removes them from the source entirely - `parse 110 props` drops
+to **0 triangles**. The source falls from 42398 to 13106 triangles, a 9-chunk scope from
+17190 to 4518, and every downstream cost with it:
+
+| | props parsed | props as obstructions |
+| --- | --- | --- |
+| re-bake one chunk, main thread | 1.12 ms | **0.62 ms** |
+| interactive dig, nav on main thread | 0.85-2.05 ms | **0.49-0.76 ms** |
+| chop a prop, main thread | 0.66-0.95 ms | **0.45-0.58 ms** |
+| bake 25 chunks on the pool | 90.9 ms | 83.4 ms |
+
+It also fixes the climb-band problem outright. Parsed, the 1.2 m crates sit inside the band
+and get stepped onto - 0.50/0.67/1.01 m of clearance. As obstructions they measure
+**1.35/1.49/1.58 m**, identical to the carts and trees, because a carve ignores the climb
+test. The margin does not double up, which confirms obstructions are marked after erosion
+rather than before; the small undershoot from the ideal 1.6 m is voxel quantisation at
+`cell_size = 0.25`.
+
+**This collapses the source-mode question.** Per-chunk groups earned their place by scoping
+props, which cached shapes could not do. With props out of the parsed geometry entirely,
+both modes carry pure terrain and scope identically (4518 triangles), and cached shapes is
+faster again (0.17 ms against 0.32) *and* the only one a worker can run. The staleness
+objection moves with the props: it is now the obstruction list that is a snapshot, and it
+has to be rebuilt when a prop is destroyed whichever source mode is selected. So the
+combination to reach for is **obstructions plus cached shapes**. Per-chunk groups stay worth
+having for geometry that has to be real - anything an agent walks under, which a footprint
+extruded straight up cannot represent.
+
+**Three ways to collect source geometry, measured against each other.** All three provably
+agree - 42398 triangles each, bounds centres 0.000 m apart - so the choice is purely about
+cost and staleness. At 17x17, 25 chunks, with a 9-chunk scope being what an incremental
+re-bake actually asks for:
+
+| mode | full build | 9-chunk scope | props go stale? | worker-safe? |
+| --- | --- | --- | --- | --- |
+| cached shapes | 0.54 ms / 42398 tri | **0.39 ms / 33810 tri** | yes, needs a re-parse | yes |
+| one flat group | 1.68 ms / 42398 tri | 1.79 ms / 42398 tri | no | no |
+| per-chunk groups | 2.39 ms / 42398 tri | **0.85 ms / 17190 tri** | no | no |
+
+Cached shapes is fastest and the only one a worker can run, but it scopes the *terrain*
+only - the props snapshot is merged in whole, which is why its scoped source still carries
+33810 triangles, and why it has to be told when a prop is destroyed. Per-chunk groups scope
+props too, halving the scoped source, and cannot go stale because they collect fresh every
+build. They are the worst choice for a *full* build, paying 25 parse-and-merge round trips,
+but full builds happen at load rather than in the dig loop.
+
+In the interactive dig that shows up as nav main-thread cost of 0.85-2.05 ms scaling with
+chunks touched, against a flat ~2.2 ms for one global group. Chopping a prop costs
+**0.66-0.95 ms** on the main thread and 3.9 ms on the worker, with no terrain work at all -
+no mesh, collision proxy, cell geometry or LOD proxy, and no `prepare()`, since nothing the
+terrain owns has changed.
+
+**`parse_source_geometry_data()` clears its target, it does not append.** Parsing N groups
+straight into one accumulator leaves only the last one, which presents as a navmesh covering
+a single chunk and every seam failing. The arithmetic identifies it precisely: 2122 triangles
+is one chunk of terrain proxy (13106/25 = 524) plus six props (6 x 266), and
+`PROPS_PER_CHUNK` is 6. `recast-source-modes-agree` caught it as a 90.5 m bounds-centre drift
+before any of it reached a conclusion. Each group is now parsed into a throwaway and
+`merge()`d in; merge is the call that accumulates.
+
+That failure also exposed a weak claim. `recast-sees-props` bounded prop clearance only from
+*below*, and "nothing walkable anywhere near this prop" clears a lower bound just as easily
+as a correctly carved hole - so it passed, reporting a mean clearance of 82 m. It is now
+bounded above as well.
+
+**Terrain LOD never touches collision, but it does not maintain itself at runtime.**
+`MSTTerrainLodController` only adds a `MeshInstance3D` proxy per chunk and drives
+`visibility_range_begin/end`; there is no `StaticBody3D` or shape anywhere in it, so a
+static-collider bake and the LOD system are disjoint. Two runtime traps, though, both from
+editor-only branches:
+
+- `_lod_controller.apply()` is reachable at runtime only through
+  `_apply_visibility_detail_settings()`, called from `add_chunk()` and from property setters.
+  The `_process()` handler that acts on the pending-update flag is inside
+  `if is_editor()`. So a terrain assembled through `attach_fast()` has LOD **on with no
+  proxies at all**, and `MSTTestAssembler.refresh_lod()` exists to build them.
+- `regenerate_mesh()` calls `invalidate_chunk()`, which frees the proxy and only raises that
+  same flag. At runtime nothing rebuilds it, and the chunk then renders **nothing** past
+  `terrain_lod_start_distance`, because `_configure_proxy_visibility()` caps its real tiles
+  at exactly that distance. `MSTTestThreadedDig` invalidates *and* drives the rebuild
+  explicitly; measured at 0.82 ms for 4 chunks, and it is inside the dig's publish, so it
+  shows up as main-thread cost (`apply()` walks every chunk, not just the dug ones).
+
+With that in place a threaded dig leaves every chunk a live proxy — 4 before, 4 after — and a
+wall dug from far away is correct on zoom-in.
 
 **Nav regions need ~10-20 physics frames before a query works**, even with
 `NavigationServer3D.map_force_update()`. An early query returns an empty path, which looks
@@ -165,6 +262,14 @@ Controls:
 - **left-click digs** — threaded, and prints where every millisecond went, main thread
   against worker. On the `Recast_*` cave the navmesh follows with a chunked Recast re-bake
   polled across frames; everywhere else it is the merger.
+- **left-click a prop chops it down instead** — navmesh only. No height changed, so there is
+  no mesh, collision proxy, cell geometry or LOD proxy work, and `prepare()` is skipped
+  because the cached chunk shapes are still valid. This is the case that separates the source
+  modes: with `Cached shapes` the log shows an extra props re-parse, because that mode
+  merges a one-off snapshot into every build and the snapshot has just gone stale. The parsed
+  modes collect props fresh and simply stop finding it. Props sit on their own collision
+  layer (bit 3; the terrain holds bits 1, 5 and 9) so decoration can be queried separately,
+  but identity comes from the `mst_nav_prop` group.
 - **middle-click sends the red cube there** — a `NavigationAgent3D`, dropped on whichever
   cave survives the run
 
@@ -201,26 +306,15 @@ near a chunk border there is the rig proving its point, not a defect.
 | `nav-merged-queryable` | A merged navmesh paths corner to corner | holds |
 | `nav-merged-every-hop` | Every chunk along the cave edge is reachable | holds |
 | `nav-merged-adjacent-pairs` | Every adjacent pair still connects when merged | holds |
-| `recast-sees-props` | Recast carves out props too tall to step onto | failed as first written; see below |
-| `recast-source-modes-agree` | Group parsing collects the same geometry as cached shapes | not yet measured |
+| `recast-sees-props` | Recast carves out props too tall to step onto | holds |
+| `recast-source-modes-agree` | All three source modes collect the same geometry | holds |
+| `recast-chunk-groups-scope` | Per-chunk groups scope a parse, props included | holds |
+| `recast-sees-props` (obstruction mode) | Crates inside the climb band block too | holds |
+| `lod-survives-threaded-dig` | A threaded dig leaves every chunk a live LOD proxy | holds |
 | `recast-seams` | Chunked Recast regions meet across every seam unaided | holds |
 | `recast-parallel` | The pool bake beats the same bakes done one at a time | holds |
 | `recast-dig-loop` | Re-baking one chunk leaves under 5 ms on the main thread | holds |
 | `recast-trimmed-border` | A few-agent-radii border aligns seams as well as a whole chunk | holds |
-
-`recast-sees-props` failed in both runs so far, and neither failure was about Recast. As
-first written it also required the *merger* to report under 0.1 m of clearance at every prop,
-and the merger reports min/mean/max 0.00/2.71/6.00 — a maximum of exactly `WALL_HEIGHT`,
-which does not match any model of where the merged navmesh should be at a prop standing on
-open floor. The claim now judges only the thing it names, and phase 9 reports, per builder,
-how many props stand on navmesh and how high the closest point sat; that is what should
-identify the merger behaviour rather than another guess. The Recast side of it passes on its
-own: props above the band measure 1.67–1.82 m of clearance.
-
-`recast-source-modes-agree` passed vacuously on its first run — both sides of the comparison
-took whichever path `recast_source_mode` selected, so it compared a mode against itself
-(all four source rows reported an identical triangle count, including the scoped one). Both
-bakers now force their mode, so the next run is the first real measurement.
 
 The three `nav-scale-*` failures all measure the per-triangle path and are superseded by
 the `nav-merged-*` results; they are kept as the A/B that identifies the cause.
@@ -279,6 +373,14 @@ also removes stranded islands — the small-region filtering a Recast bake would
 
 **Warm-up is the load-time cost.** ~270 / 72 ms per chunk on one worker, so a 25-chunk cave
 is ~6.8 / 1.8 s. Fan it across cores or spread it over frames.
+
+**Open: the merger does not cover most prop positions, and it is not the rock tops.** Phase 9
+reports 19 of 110 props standing on merged navmesh, with the closest point averaging 2.71 m
+away at y = 0.00 and *zero* props whose closest point is more than 1 m above the floor — so
+the queries are landing on floor, not on the walkable wall tops. Props are placed with two
+vertices (4 m) of all-floor clearance and the merger erodes one cell (2 m), so they should
+sit on navmesh. They mostly do not, and no reading of the merger explains it yet. It does not
+affect any Recast result, and the `recast-sees-props` claim no longer depends on it.
 
 **Merged vertices now snap to the map's grid.** `_weld()` snaps to
 `map_get_cell_size() * 0.1` before welding, so two vertices the navigation map already
@@ -390,10 +492,9 @@ behaviour but would muddy the clearance measurement.
 
 ## Next
 
-**Carve props that must block regardless of height.**
-`NavigationMeshSourceGeometryData3D.add_projected_obstruction(vertices, elevation, height,
-true)` ignores the climb test entirely, which is the right answer for a mine cart or a
-barrier that happens to be short. Not wired up yet.
+**Give the cave a ceiling.** Recast drops walkable surface without `agent_height` clearance
+above it, so a ceiling removes the walkable rock tops for free - something the merger can
+never do, because a height map has no ceiling. Failing that, a reachability flood-fill.
 
 **Decide per map, not globally.** The merger is heightmap-only and cheap; Recast is
 geometry-accurate and re-voxelises data already held as a height grid. The cave may well
