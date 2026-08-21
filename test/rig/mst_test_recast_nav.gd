@@ -64,20 +64,22 @@ const REGIONS_ROOT_NAME : String = "RecastNavRegions"
 
 #region settings
 
-## Voxel size for the bake. Left at the navigation map's own cell size, because
-## the two are not independent - see match_map_cells.
-var cell_size : float = 0.25
-## Vertical voxel size, and the resolution the climb test is decided at.
+## Template every chunk's navigation mesh is duplicated from, and the same object
+## that drives source geometry parsing.
 ##
-## This is what decides whether a short prop leaves a hole. A prop standing on
-## the floor does not rasterise as floor-plus-obstacle: floor and prop merge into
-## one solid span, so the column's walkable surface *is* the prop's top, and the
-## only question left is whether that top is within agent_max_climb of its
-## neighbours. Recast asks that in voxels, floor(agent_max_climb / cell_height),
-## so at 0.5 the test only resolved in half-metre steps and a 1.2 m crate rounded
-## down into "steppable". At 0.25 the climb test gets 4 voxels and a nominal
-## 1.0 m climb is exactly 1.0 m, which is the answer agent_max_climb implies.
-var cell_height : float = 0.25
+## Assign a NavigationMesh resource to tune the bake in the Inspector instead of
+## in code - cell sizes, agent metrics, the region and edge simplification knobs,
+## the filters, and the two that decide what gets parsed at all:
+## geometry_parsed_geometry_type (static colliders, mesh instances, or both) and
+## geometry_source_geometry_mode (a root node's children, or a group). Leave it
+## null and default_settings() supplies the values below.
+##
+## Never mutated. prepare() takes a working copy, and each chunk gets its own
+## duplicate of that with filter_baking_aabb and border_size overwritten - those
+## two belong to the chunking scheme, not to the user, so whatever the template
+## carries for them is ignored.
+var bake_settings : NavigationMesh
+
 ## Take cell_size and cell_height from the navigation map at prepare() time.
 ##
 ## These are not free parameters. The map keeps its own cell_size and cell_height
@@ -91,34 +93,96 @@ var cell_height : float = 0.25
 ## coarser - 0.5 is the textbook value for a 1 m agent radius, and a quarter of
 ## the columns - move the *map* with apply_to_map() or the
 ## navigation/3d/default_cell_size project setting, and this follows it down.
+## Switching this off lets the template's own cell values stand.
 var match_map_cells : bool = true
-var agent_radius : float = 1.0
-var agent_height : float = 2.0
-## Anything whose top stands less than this above the surrounding floor is
-## something the agent steps onto rather than walks around, prop or terrain
-## alike. Props shorter than this will not carve a hole no matter how solid they
-## are; see the class docs for what to do about the ones that must always block.
-var agent_max_climb : float = 1.0
-var agent_max_slope : float = 45.0
-## Recast's three optional heightfield filters, set explicitly rather than left
-## to whatever NavigationMesh defaults to, because two of them change whether a
-## prop blocks.
-##
-## low_hanging_obstacles marks a non-walkable span walkable when its top is
-## within agent_max_climb of a walkable neighbour - it makes *more* props
-## steppable, which is the opposite of what this bake is for. ledge_spans drops
-## surfaces next to a drop the agent cannot survive. low_height_spans drops
-## walkable surface with less than agent_height of clearance above it, which is
-## what a ceiling would need.
-var filter_low_hanging_obstacles : bool = false
-var filter_ledge_spans : bool = false
-var filter_walkable_low_height_spans : bool = false
+
 ## Grow and border, in world units. 0 means "one whole chunk", which is what the
 ## demo does. See recommended_border() for the cheaper alternative.
 var border_size : float = 0.0
 ## false bakes the same chunks in a plain loop on the calling thread, which is
 ## the only way to state a parallel speed-up as a measured number.
 var parallel : bool = true
+
+#endregion
+
+#region settings shortcuts
+
+## Read straight off the working copy, so callers - and the rig's report - see
+## whatever the template actually carries rather than a stale mirror of it.
+
+var cell_size : float:
+	get: return settings().cell_size
+	set(value): settings().cell_size = value
+
+## Vertical voxel size, and the resolution the climb test is decided at.
+##
+## This is what decides whether a short prop leaves a hole. A prop standing on
+## the floor does not rasterise as floor-plus-obstacle: floor and prop merge into
+## one solid span, so the column's walkable surface *is* the prop's top, and the
+## only question left is whether that top is within agent_max_climb of its
+## neighbours. Recast asks that in voxels, floor(agent_max_climb / cell_height),
+## so at 0.5 the test only resolved in half-metre steps and a 1.2 m crate rounded
+## down into "steppable". At 0.25 the climb test gets 4 voxels and a nominal
+## 1.0 m climb is exactly 1.0 m, which is the answer agent_max_climb implies.
+var cell_height : float:
+	get: return settings().cell_height
+	set(value): settings().cell_height = value
+
+var agent_radius : float:
+	get: return settings().agent_radius
+	set(value): settings().agent_radius = value
+
+var agent_height : float:
+	get: return settings().agent_height
+	set(value): settings().agent_height = value
+
+## Anything whose top stands less than this above the surrounding floor is
+## something the agent steps onto rather than walks around, prop or terrain
+## alike. Props shorter than this will not carve a hole no matter how solid they
+## are; see reliable_block_height() and the class docs.
+var agent_max_climb : float:
+	get: return settings().agent_max_climb
+	set(value): settings().agent_max_climb = value
+
+var agent_max_slope : float:
+	get: return settings().agent_max_slope
+	set(value): settings().agent_max_slope = value
+
+
+## The working copy: the template with match_map_cells applied, or the built-in
+## defaults if no template was given. Created on first use so a caller can read
+## and write these before prepare() runs.
+func settings() -> NavigationMesh:
+	if _settings == null:
+		_settings = bake_settings.duplicate() if bake_settings != null else default_settings()
+	return _settings
+
+
+## What the rig bakes with when no template resource is assigned. Also the
+## reference for what test/rig/mst_recast_bake_settings.tres should contain.
+##
+## The three filters are set explicitly rather than left to NavigationMesh's
+## defaults, because two of them change whether a prop blocks.
+## filter_low_hanging_obstacles marks a non-walkable span walkable when its top
+## is within agent_max_climb of a walkable neighbour - it makes *more* props
+## steppable, which is the opposite of what this bake is for. filter_ledge_spans
+## drops surfaces beside a drop the agent cannot survive. And
+## filter_walkable_low_height_spans drops walkable surface with less than
+## agent_height of clearance above it, which is what a ceiling would need.
+static func default_settings() -> NavigationMesh:
+	var settings := NavigationMesh.new()
+	settings.cell_size = 0.25
+	settings.cell_height = 0.25
+	settings.agent_radius = 1.0
+	settings.agent_height = 2.0
+	settings.agent_max_climb = 1.0
+	settings.agent_max_slope = 45.0
+	settings.filter_low_hanging_obstacles = false
+	settings.filter_ledge_spans = false
+	settings.filter_walkable_low_height_spans = false
+	settings.geometry_parsed_geometry_type = NavigationMesh.PARSED_GEOMETRY_STATIC_COLLIDERS
+	settings.geometry_source_geometry_mode = NavigationMesh.SOURCE_GEOMETRY_ROOT_NODE_CHILDREN
+	return settings
 
 #endregion
 
@@ -148,6 +212,7 @@ var _group_task_id : int = -1
 var _bake_start_usec : int = 0
 var _map_cell_size : float = 0.25
 var _map_cell_height : float = 0.25
+var _settings : NavigationMesh
 
 
 ## Moves the navigation map onto this baker's cell size instead of the other way
@@ -159,8 +224,8 @@ func apply_to_map(terrain: MarchingSquaresTerrain) -> void:
 	var map := terrain.get_world_3d().navigation_map
 	NavigationServer3D.map_set_cell_size(map, cell_size)
 	NavigationServer3D.map_set_cell_height(map, cell_height)
-	_map_cell_size = cell_size
-	_map_cell_height = cell_height
+	_map_cell_size = settings().cell_size
+	_map_cell_height = settings().cell_height
 	match_map_cells = false
 
 
@@ -234,9 +299,12 @@ func prepare(terrain: MarchingSquaresTerrain) -> int:
 	var map := terrain.get_world_3d().navigation_map
 	_map_cell_size = NavigationServer3D.map_get_cell_size(map)
 	_map_cell_height = NavigationServer3D.map_get_cell_height(map)
+	# Rebuilt every prepare() so an edit to the template between bakes is picked
+	# up, and so the template itself is never the thing being written to.
+	_settings = bake_settings.duplicate() if bake_settings != null else default_settings()
 	if match_map_cells:
-		cell_size = _map_cell_size
-		cell_height = _map_cell_height
+		_settings.cell_size = _map_cell_size
+		_settings.cell_height = _map_cell_height
 	_chunk_geometry.clear()
 
 	var span_x := float(terrain.dimensions.x - 1) * terrain.cell_size.x
@@ -271,13 +339,12 @@ static func find_collision_shape(chunk: MarchingSquaresTerrainChunk) -> ConcaveP
 	return null
 
 
-## Parse settings are only read during parsing, so the same throwaway
-## NavigationMesh serves for props and terrain alike.
+## Parsing reads the geometry_* properties off a NavigationMesh, so the template
+## drives what gets collected as well as how it is baked - switch the template to
+## PARSED_GEOMETRY_MESH_INSTANCES or to a group source mode and both parse calls
+## follow. Handed a duplicate so nothing downstream can write to the working copy.
 func _parse_settings() -> NavigationMesh:
-	var settings := NavigationMesh.new()
-	settings.geometry_parsed_geometry_type = NavigationMesh.PARSED_GEOMETRY_STATIC_COLLIDERS
-	settings.geometry_source_geometry_mode = NavigationMesh.SOURCE_GEOMETRY_ROOT_NODE_CHILDREN
-	return settings
+	return settings().duplicate()
 
 #endregion
 
@@ -343,12 +410,16 @@ func begin_bake(bake_coords: Array = [], source_coords: Array = [], prebuilt_sou
 		var box : AABB = entry["box"]
 		box.position.y = y_min
 		box.size.y = y_max - y_min
+		# One duplicate per chunk, made here rather than on the worker so every
+		# job owns its NavigationMesh outright before any of them start.
+		var chunk_navmesh : NavigationMesh = settings().duplicate()
+		chunk_navmesh.filter_baking_aabb = box.grow(grow)
+		chunk_navmesh.border_size = grow
 		_jobs.append({
 			"coords": coords,
 			"source": source,
-			"bounds": box.grow(grow),
-			"grow": grow,
-			"navmesh": null,
+			"navmesh": chunk_navmesh,
+			"baked": false,
 		})
 
 	chunks_baked = _jobs.size()
@@ -382,18 +453,8 @@ func end_bake() -> void:
 
 func _bake_one(index: int) -> void:
 	var job : Dictionary = _jobs[index]
-	var nav_mesh := NavigationMesh.new()
-	nav_mesh.cell_size = cell_size
-	nav_mesh.cell_height = cell_height
-	nav_mesh.agent_radius = agent_radius
-	nav_mesh.agent_height = agent_height
-	nav_mesh.agent_max_climb = agent_max_climb
-	nav_mesh.agent_max_slope = agent_max_slope
-	nav_mesh.filter_low_hanging_obstacles = filter_low_hanging_obstacles
-	nav_mesh.filter_ledge_spans = filter_ledge_spans
-	nav_mesh.filter_walkable_low_height_spans = filter_walkable_low_height_spans
-	nav_mesh.filter_baking_aabb = job["bounds"]
-	nav_mesh.border_size = job["grow"]
+	# Already carries the template's settings plus this chunk's bake bounds.
+	var nav_mesh : NavigationMesh = job["navmesh"]
 	NavigationServer3D.bake_from_source_geometry_data(nav_mesh, job["source"])
 	# Cleared only so the debug draw does not outline the grown bake box.
 	nav_mesh.filter_baking_aabb = AABB()
@@ -407,7 +468,7 @@ func _bake_one(index: int) -> void:
 		vertices[i] = vertices[i].snappedf(snap)
 	nav_mesh.set_vertices(vertices)
 
-	job["navmesh"] = nav_mesh
+	job["baked"] = true
 
 #endregion
 
@@ -418,10 +479,11 @@ func publish() -> void:
 	var start_usec := Time.get_ticks_usec()
 	_ensure_regions_root()
 	for job: Dictionary in _jobs:
-		var nav_mesh : NavigationMesh = job["navmesh"]
-		if nav_mesh == null:
+		# Publishing an unbaked duplicate would hand a region an empty mesh and
+		# look exactly like a chunk that legitimately lost its polygons.
+		if not bool(job["baked"]):
 			continue
-		_region_for(job["coords"]).navigation_mesh = nav_mesh
+		_region_for(job["coords"]).navigation_mesh = job["navmesh"]
 
 	# Counted over every live region, not just the ones in this batch, so the
 	# totals stay right after an incremental rebuild.

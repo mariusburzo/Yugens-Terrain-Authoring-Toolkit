@@ -35,6 +35,17 @@ const AGENT_SPEED : float = 14.0
 ## Leaves the last assembled terrain in the scene with a camera so seams can be
 ## inspected by eye, and left-click digs a hole.
 @export var interactive_after_run : bool = true
+## Template every chunk's navigation mesh is duplicated from in phase 9, and the
+## same resource that decides what source geometry gets parsed.
+##
+## Point it at test/rig/mst_recast_bake_settings.tres to tune the bake from the
+## Inspector - agent metrics, the filters, the simplification knobs, and
+## geometry_parsed_geometry_type / geometry_source_geometry_mode. Left null, the
+## baker falls back to MSTTestRecastNav.default_settings().
+##
+## filter_baking_aabb and border_size are overwritten per chunk; whatever the
+## resource carries for those two is ignored.
+@export var recast_bake_settings : NavigationMesh
 
 ## Phases, in the order they run. Every one builds its own terrain from scratch,
 ## so switching off the ones you are not reading is a straight saving - the only
@@ -442,9 +453,9 @@ func _phase_threading(suite: String, dimensions: Vector3i, factory: MSTTestModul
 		await get_tree().process_frame
 	job.publish()
 
-	var main_thread_msec := job.prologue_msec + job.publish_msec
+	var main_thread_msec := job.main_thread_msec()
 	_report.add_timing(suite, "6-threaded", "threaded dig: main thread total", main_thread_msec,
-		"prologue %.2f + publish %.2f" % [job.prologue_msec, job.publish_msec])
+		"prologue %.2f + join %.2f + publish %.2f" % [job.prologue_msec, job.join_msec, job.publish_msec])
 	_report.add_timing(suite, "6-threaded", "threaded dig: worker", job.worker_msec,
 		"%d frame(s) in flight" % job.frames_in_flight)
 	_report.add_timing(suite, "6-threaded", "same dig done synchronously", float(sync_reference["total_msec"]),
@@ -454,8 +465,9 @@ func _phase_threading(suite: String, dimensions: Vector3i, factory: MSTTestModul
 		"threaded-dig-residue",
 		"[%s] A threaded dig leaves less than half the synchronous cost on the main thread" % suite,
 		main_thread_msec < float(sync_reference["total_msec"]) * 0.5,
-		"main thread %.2f ms (prologue %.2f + publish %.2f) vs %.2f ms synchronous; worker did %.2f ms" % [
-			main_thread_msec, job.prologue_msec, job.publish_msec, sync_reference["total_msec"], job.worker_msec
+		"main thread %.2f ms (prologue %.2f + join %.2f + publish %.2f) vs %.2f ms synchronous; worker did %.2f ms" % [
+			main_thread_msec, job.prologue_msec, job.join_msec, job.publish_msec,
+			sync_reference["total_msec"], job.worker_msec
 		]
 	)
 	_report.add_claim(
@@ -676,6 +688,14 @@ func _phase_nav_scale(suite: String, dimensions: Vector3i, factory: MSTTestModul
 # The merger is not being replaced here. It reads height_map and nothing else,
 # which is why it is fast and why it is blind. This phase measures the other
 # trade.
+## All three bakers in phase 9 share one template, so the parallel-vs-serial and
+## whole-chunk-vs-trimmed comparisons differ only in the thing being compared.
+func _make_recast_baker() -> MSTTestRecastNav:
+	var baker := MSTTestRecastNav.new()
+	baker.bake_settings = recast_bake_settings
+	return baker
+
+
 func _phase_recast_nav(suite: String, dimensions: Vector3i, factory: MSTTestModules) -> void:
 	# Only one set of regions may be on the navigation map while clearances are
 	# measured, or a query lands on the other terrain's polygons.
@@ -727,12 +747,20 @@ func _phase_recast_nav(suite: String, dimensions: Vector3i, factory: MSTTestModu
 		await get_tree().physics_frame
 
 	# --- Recast, demo-faithful: grow by a whole chunk, bake in parallel -------
-	var baker := MSTTestRecastNav.new()
+	var baker := _make_recast_baker()
 	baker.parse_props(props)
 	var prepared := baker.prepare(terrain)
 	baker.bake()
 	baker.publish()
 
+	_report.add_note("[%s] Bake settings from %s: cell %.2f/%.2f, agent radius %.2f height %.2f climb %.2f slope %.0f, parsed geometry type %d, source mode %d." % [
+		suite,
+		recast_bake_settings.resource_path if recast_bake_settings != null and not recast_bake_settings.resource_path.is_empty()
+			else ("an inline resource" if recast_bake_settings != null else "MSTTestRecastNav.default_settings()"),
+		baker.cell_size, baker.cell_height, baker.agent_radius, baker.agent_height,
+		baker.agent_max_climb, baker.agent_max_slope,
+		baker.settings().geometry_parsed_geometry_type, baker.settings().geometry_source_geometry_mode
+	])
 	_report.add_timing(suite, "9-recast", "parse %d props (main thread)" % prop_centres.size(),
 		baker.parse_msec, "%d triangles, done once because props are static" % baker.prop_triangles)
 	_report.add_timing(suite, "9-recast", "prepare %d chunks (main thread)" % prepared,
@@ -833,7 +861,7 @@ func _phase_recast_nav(suite: String, dimensions: Vector3i, factory: MSTTestModu
 	])
 
 	# --- the same bakes, serially, so the speed-up is a measured number -------
-	var serial := MSTTestRecastNav.new()
+	var serial := _make_recast_baker()
 	serial.parallel = false
 	serial.parse_props(props)
 	serial.prepare(terrain)
@@ -888,7 +916,7 @@ func _phase_recast_nav(suite: String, dimensions: Vector3i, factory: MSTTestModu
 	)
 
 	# --- trimmed border: the demo grows by a whole chunk, which is 9x the work -
-	var trimmed := MSTTestRecastNav.new()
+	var trimmed := _make_recast_baker()
 	trimmed.parse_props(props)
 	trimmed.prepare(terrain)
 	trimmed.border_size = trimmed.recommended_border()
@@ -1113,10 +1141,14 @@ func _dig_at_screen_position(screen_position: Vector2) -> void:
 	var job := MSTTestThreadedDig.new()
 	job.start(terrain, Vector2i(gx - 2, gz - 2), Vector2i(5, 5), MSTTestModules.FLOOR_HEIGHT)
 	while job.is_running():
+		# Counts the frame and checks the chunk still has collision on it. The
+		# swap-shape design exists to guarantee exactly that, so it is worth
+		# proving live rather than only in phase 6.
+		job.sample_collision()
 		await get_tree().process_frame
 	job.publish()
 	var dug : Array = job.affected_coords()
-	var dig_main_msec := job.prologue_msec + job.publish_msec
+	var dig_main_msec := job.main_thread_msec()
 
 	# The navmesh is rebuilt in view, so Debug > Visible Navigation shows the hole
 	# appear straight away. Which builder does it depends on which terrain was
@@ -1156,12 +1188,15 @@ func _dig_at_screen_position(screen_position: Vector2) -> void:
 	if nav_regions > 0 and NavigationServer3D.has_method("map_force_update"):
 		NavigationServer3D.map_force_update(terrain.get_world_3d().navigation_map)
 
-	print("[rig] dig %d on %s at (%d, %d), %d chunk(s): MAIN THREAD %.2f ms = terrain %.2f (prologue %.2f + publish %.2f) + nav %.2f" % [
+	print("[rig] dig %d on %s at (%d, %d), %d chunk(s): MAIN THREAD %.2f ms = terrain %.2f (prologue %.2f + join %.2f + publish %.2f) + nav %.2f" % [
 		_dig_count, terrain.name, gx, gz, dug.size(),
-		dig_main_msec + nav_main_msec, dig_main_msec, job.prologue_msec, job.publish_msec, nav_main_msec
+		dig_main_msec + nav_main_msec, dig_main_msec,
+		job.prologue_msec, job.join_msec, job.publish_msec, nav_main_msec
 	])
-	print("[rig]   worker: terrain %.2f ms over %d frame(s), nav %.2f ms across %d region(s)" % [
-		job.worker_msec, job.frames_in_flight, nav_worker_msec, nav_regions
+	# A large join means the poll loop exited before the worker did and the main
+	# thread blocked for the difference - the one way this can quietly stall.
+	print("[rig]   worker: terrain %.2f ms over %d frame(s), nav %.2f ms across %d region(s); %d frame(s) without collision" % [
+		job.worker_msec, job.frames_in_flight, nav_worker_msec, nav_regions, job.frames_without_collision
 	])
 	_dig_in_flight = false
 

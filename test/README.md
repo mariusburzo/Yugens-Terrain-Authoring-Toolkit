@@ -231,6 +231,7 @@ the `nav-merged-*` results; they are kept as the A/B that identifies the cause.
 | `rig/mst_test_threaded_dig.gd` | The same dig on a worker, plus chunk warm-up |
 | `rig/mst_test_nav.gd` | Per-chunk regions, the merger, clearance, path probes |
 | `rig/mst_test_recast_nav.gd` | Chunked Recast baking on the worker pool |
+| `rig/mst_recast_bake_settings.tres` | The `NavigationMesh` template phase 9 bakes from |
 | `rig/mst_test_props.gd` | Placeholder decoration, and the prop-clearance probe |
 | `rig/mst_test_report.gd` | Collects and prints the results table |
 | `tools/export_chunk_as_module.gd` | Editor script: export sculpted chunks as modules |
@@ -314,6 +315,20 @@ Vertices are snapped to a tenth of the map's cell size against seam float error.
    reach past the edge, which is `walkable_radius + 3` voxels; `recommended_border()`
    returns 4 m for a 1 m agent at 0.5 m cells, which is 8 voxels. Phase 9 bakes both and
    asks whether the cheap one still holds its seams.
+
+**Every Recast parameter is a resource, not a constant.** `rig/mst_recast_bake_settings.tres`
+is a `NavigationMesh` assigned to the rig node’s `recast_bake_settings`, and each chunk bakes
+from a duplicate of it — so agent metrics, the filters, the region and edge simplification
+knobs, and crucially `geometry_parsed_geometry_type` and `geometry_source_geometry_mode` are
+all editable in the Inspector. The same resource drives parsing, so switching it to
+`PARSED_GEOMETRY_MESH_INSTANCES` makes both parse calls collect meshes instead of colliders
+with no code change. Two properties are overwritten per chunk and ignored on the template:
+`filter_baking_aabb` and `border_size`, which belong to the chunking scheme. The template is
+never mutated — `prepare()` takes a working copy, so `match_map_cells` writing the map’s cell
+size into it cannot dirty the `.tres`. Leave the export null and
+`MSTTestRecastNav.default_settings()` supplies the values the measurements above were taken
+with. The resource ships with only the properties those measurements exercised; the rest are
+at their defaults and can be added from the Inspector.
 
 **Caveats this bakes in.** The terrain faces are the addon's *simplified* greedy-merged
 proxy extruded downward by `collision_thickness`, not the visual mesh — fine for flat-celled

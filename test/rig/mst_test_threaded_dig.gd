@@ -18,6 +18,13 @@ class_name MSTTestThreadedDig
 var prologue_msec : float = 0.0
 var worker_msec : float = 0.0
 var publish_msec : float = 0.0
+## Time the main thread spent blocked in wait_to_finish().
+##
+## Measured separately because it is the number that catches a caller polling
+## is_running() wrongly. Poll correctly and this is ~0; exit the loop early and
+## the whole worker cost lands here instead, where it would otherwise be
+## invisible - publish_msec starts its clock after the join, not before.
+var join_msec : float = 0.0
 var frames_in_flight : int = 0
 var frames_without_collision : int = 0
 
@@ -79,6 +86,11 @@ func affected_coords() -> Array:
 	return coords
 
 
+## Everything this dig actually cost the frames it ran on.
+func main_thread_msec() -> float:
+	return prologue_msec + join_msec + publish_msec
+
+
 ## Called once per frame while the job is in flight, to prove the chunk keeps its
 ## collision for the whole duration.
 func sample_collision() -> void:
@@ -130,9 +142,11 @@ func _build_navmesh(chunk: MarchingSquaresTerrainChunk) -> NavigationMesh:
 
 ## Joins the worker and applies everything that has to touch the scene tree.
 func publish() -> void:
+	var join_start := Time.get_ticks_usec()
 	if _thread != null:
 		_thread.wait_to_finish()
 		_thread = null
+	join_msec = (Time.get_ticks_usec() - join_start) / 1000.0
 	var start_usec := Time.get_ticks_usec()
 
 	for chunk: MarchingSquaresTerrainChunk in _chunks:

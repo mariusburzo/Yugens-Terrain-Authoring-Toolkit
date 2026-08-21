@@ -1,0 +1,7 @@
+[gd_resource type="NavigationMesh" format=3 uid="uid://cxpictu11olkh"]
+
+[resource]
+geometry_parsed_geometry_type = 1
+agent_height = 2.0
+agent_radius = 1.0
+agent_max_climb = 1.0
