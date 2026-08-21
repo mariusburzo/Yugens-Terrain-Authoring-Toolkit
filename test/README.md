@@ -96,6 +96,16 @@ intended — 13106 triangles down to 4518, precisely 9/25 — but the scoped sou
 source**, at ~266 triangles each, because the parser tessellates their `CylinderShape3D` and
 `BoxShape3D` colliders. That is what per-chunk groups and projected obstructions attack.
 
+**Parsed geometry keeps its walk-under clearance; a carve would not.** With the deck 3.0 m up
+and `agent_height` at 2.0, the floor beneath each bridge stays walkable and horizontal
+clearance under a deck measures 0.00 m - the navmesh runs directly under it. The same bridge
+supplied as a projected obstruction would have been a footprint extruded from the ground up,
+sealing the corridor. That is the whole reason the parsed lane exists.
+
+Decks with a prop standing under them are excluded from that measurement: their floor is
+carved by the crate, correctly, at the usual ~1.5 m. Props scatter into the same corridors the
+bridges span, so roughly a quarter of the decks have one.
+
 **A Recast navmesh does not lie on the surface it was baked from.** Measured at **~0.5 m**
 above the floor, consistently, at `cell_height = 0.25` - roughly two cell heights, from voxel
 rounding in the poly mesh. Harmless for agents, but it silently broke two measurements here:
@@ -348,7 +358,7 @@ near a chunk border there is the rig proving its point, not a defect.
 | `recast-chunk-groups-scope` | Per-chunk groups scope a parse, props included | holds |
 | `recast-sees-props` (obstruction mode) | Crates inside the climb band block too | holds |
 | `lod-survives-threaded-dig` | A threaded dig leaves every chunk a live LOD proxy | holds |
-| `recast-walk-under-bridge` | The floor under a bridge deck stays walkable | holds once measured on xz; see below |
+| `recast-walk-under-bridge` | The floor under a bridge deck stays walkable | holds |
 | `recast-seams` | Chunked Recast regions meet across every seam unaided | holds |
 | `recast-parallel` | The pool bake beats the same bakes done one at a time | holds |
 | `recast-dig-loop` | Re-baking one chunk leaves under 5 ms on the main thread | holds |

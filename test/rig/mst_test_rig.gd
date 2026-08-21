@@ -860,8 +860,10 @@ func _phase_recast_nav(suite: String, dimensions: Vector3i, factory: MSTTestModu
 			_recast_obstructions.size(), baker.agent_radius
 		] if recast_props_as_obstructions else "parsed collision geometry"
 	])
-	_report.add_timing(suite, "9-recast", "parse %d props (main thread)" % prop_centres.size(),
-		baker.parse_msec, "%d triangles, done once because props are static" % baker.prop_triangles)
+	_report.add_timing(suite, "9-recast", "parse props + statics (main thread)",
+		baker.parse_msec, "%d props, %d bridges, %d triangles; only what is not carved or cached" % [
+			prop_centres.size(), MSTTestStatics.under_deck_points(statics).size(), baker.prop_triangles
+		])
 	_report.add_timing(suite, "9-recast", "prepare %d chunks (main thread)" % prepared,
 		baker.prepare_msec, "resolve shapes and transforms a worker may not read")
 	_report.add_timing(suite, "9-recast", "assemble source geometry", baker.assemble_msec,
@@ -967,14 +969,30 @@ func _phase_recast_nav(suite: String, dimensions: Vector3i, factory: MSTTestModu
 	# real geometry the floor under the deck stays walkable; a footprint extruded
 	# straight up would have carved that floor away and sealed the corridor.
 	var under_deck : Array = MSTTestStatics.under_deck_points(statics)
-	if not under_deck.is_empty():
-		var under := MSTTestProps.nav_clearance(terrain, under_deck)
+	# Props are scattered in the same corridors the bridges span, so some decks
+	# have a crate standing under them. That floor is carved by the prop, exactly
+	# as it should be - counting it against the bridge would be measuring the
+	# wrong thing, so those samples are dropped and reported separately.
+	var prop_shadow := baker.agent_radius + 1.5
+	var clear_under : Array = []
+	for point: Vector3 in under_deck:
+		var shadowed := false
+		for centre: Vector3 in prop_centres:
+			if Vector2(point.x - centre.x, point.z - centre.z).length() < prop_shadow:
+				shadowed = true
+				break
+		if not shadowed:
+			clear_under.append(point)
+
+	if not clear_under.is_empty():
+		var under := MSTTestProps.nav_clearance(terrain, clear_under)
 		_report.add_claim(
 			"recast-walk-under-bridge",
 			"[%s] The floor under a bridge deck stays walkable" % suite,
-			int(under["on_navmesh"]) * 5 >= under_deck.size() * 4,
-			"%d of %d bridge undersides sit on navmesh; horizontal clearance min/mean/max %.2f/%.2f/%.2f m, navmesh %.2f m above the floor, deck at %.1f m" % [
-				under["on_navmesh"], under_deck.size(),
+			int(under["on_navmesh"]) * 5 >= clear_under.size() * 4,
+			"%d of %d undersides on navmesh (%d of %d decks excluded, a prop stands under them); horizontal clearance min/mean/max %.2f/%.2f/%.2f m, navmesh %.2f m above the floor, deck at %.1f m" % [
+				under["on_navmesh"], clear_under.size(),
+				under_deck.size() - clear_under.size(), under_deck.size(),
 				under["min"], under["mean"], under["max"], under["mean_rise"],
 				MSTTestStatics.DECK_CLEARANCE
 			]
